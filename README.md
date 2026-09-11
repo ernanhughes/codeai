@@ -86,3 +86,25 @@ The next implementation slice should be empirical rather than ornamental:
 7. the first experiment: **same-model repeated sampling vs heterogeneous sampling at matched cost**.
 
 The browser extension belongs on top of this runtime as a control surface. It should transport interaction, display state, and submit directives; it should not own the intellectual history of the work.
+
+## First OpenCode path
+
+OpenCode currently exposes a headless HTTP server. Start it in the repository you want it to operate on:
+
+```bash
+opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+If you protect the server, set `OPENCODE_SERVER_PASSWORD` (and optionally `OPENCODE_SERVER_USERNAME`). Then send a bounded instruction through codeai:
+
+```bash
+codeai opencode "Inspect the repository and report the failing tests. Do not modify files."
+```
+
+The adapter creates one OpenCode session and returns its ID. Continue the same OpenCode session with:
+
+```bash
+codeai opencode --session <session-id> "Now propose the smallest fix."
+```
+
+This direct CLI path is intentionally only a control surface. The next slice will record each OpenCode action, result, cost, artifacts, preconditions, and verification outcome in the ledger before we automate browser-to-browser loops.
