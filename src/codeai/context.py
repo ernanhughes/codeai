@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import asdict
-from typing import Iterable
 
 from .domain import ActorRef, ContextPackage, Seal
 from .ledger import Event
