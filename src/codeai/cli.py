@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     exp_run = exp_sub.add_parser("run", help="run one experiment arm")
     exp_run.add_argument("--experiment", required=True)
-    exp_run.add_argument("--arm", required=True, choices=["C0", "C1", "H1"])
+    exp_run.add_argument("--arm", required=True, help="arm name as preregistered (e.g. C0, C1, H1, P2C, P2S)")
     exp_run.add_argument("--tasks", default=None, help="optional subset of corpus task ids")
     exp_run.add_argument("--candidates-dir", default=None)
     exp_run.add_argument("--dry-run", action="store_true")
