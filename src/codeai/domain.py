@@ -220,3 +220,6 @@ class CallSpec:
     budget: Budget | None = None
     variant: Variant = field(default_factory=Variant)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Experiment grouping (optional; ledger-recoverable analysis keys).
+    experiment_id: str | None = None
+    arm: str | None = None

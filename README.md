@@ -176,6 +176,55 @@ First experiment now possible: C1 (`--experiment C1 --models same --count N`) vs
 (`--experiment H1 --models a,b,c`) on the same base prompt/context; the ledger yields
 cost, latency, success/failure, verification outcome, unique rescues, and concurrence.
 
+## First controlled experiment (C0 / C1 / H1)
+
+C1 is mandatory: without repeated single-model sampling, any H1 gain can be falsely
+attributed to heterogeneity when it is merely best-of-N sampling.
+
+```text
+C0 = one model, one sample, hidden verification
+C1 = one model, N sealed independent samples, hidden verification of each
+H1 = N heterogeneous model samples, sealed, hidden verification of each
+```
+
+All arms share `sealed_fanout`; only actor/model configuration differs. There is no
+synthesis: selection is by verifier only (`oracle@k` = did at least one candidate
+pass?). `oracle@k != deployable selection performance`, and `agreement != verification`.
+
+Configure logical models in `.codeai/config.toml` (no secrets; keys via env):
+
+```toml
+[models.qwen]
+adapter = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen"
+
+[models.claude]
+adapter = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[models.gpt]
+adapter = "openai"
+model = "gpt-4o-mini"
+```
+
+Run:
+
+```bash
+codeai models init && codeai models list   # shows missing credentials
+codeai experiment create --name "C1-vs-H1-v1" --hypothesis "..." \
+  --tasks all --c1 qwen --c1-samples 3 --h1 qwen,claude,gpt --max-calls 100 --dry-run
+codeai experiment run --experiment <id> --arm C1
+codeai experiment run --experiment <id> --arm H1
+codeai experiment report <id>              # includes heterogeneity premium
+codeai experiment export <id> --out exp.json
+```
+
+The corpus (`seeded-code-v1`, 12 tasks) hides tests from models; each candidate runs in
+an isolated directory from the same starting state, and only the hidden verifier
+decides `VERIFIER_PASS`. Report covers oracle@k, cost per solve, conditional failure
+`P(B fails|A fails)`, unique rescues, matched-budget comparison, and tiny-N warnings.
+
 Deliberately deferred: automated synthesis, debate loops, learned routing/bandits,
 web dashboard, browser extension, graph/vector DBs, autonomous loops, majority-vote
 decision making, model-judge-as-truth.

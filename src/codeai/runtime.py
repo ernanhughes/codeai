@@ -321,6 +321,8 @@ class Runtime:
         objective: str | None = None,
         prompt_version: str | None = None,
         instruction: str = "",
+        experiment_id: str | None = None,
+        arm: str | None = None,
     ) -> tuple[CallResult, ...]:
         """First genuine collaboration primitive: N sealed independent calls.
 
@@ -348,6 +350,8 @@ class Runtime:
                     "run_id": run_id,
                     "call_ids": call_ids,
                     "base_prompt": base_prompt,
+                    "experiment_id": experiment_id,
+                    "arm": arm,
                 },
                 correlation_id=task_id,
             )
@@ -403,6 +407,10 @@ class Runtime:
                 prompt_version=str(prompt_version) if prompt_version else None,
                 variant=variant,  # type: ignore[arg-type]
                 metadata={"fanout_id": fanout_id},
+                experiment_id=str(branch.get("experiment_id", experiment_id))
+                if branch.get("experiment_id", experiment_id) is not None
+                else None,
+                arm=str(branch.get("arm", arm)) if branch.get("arm", arm) is not None else None,
             )
             try:
                 result = self.invoke_call(spec, adapter=adapter)
@@ -636,6 +644,10 @@ class Runtime:
         payload["directive_id"] = spec.directive_id
         payload["run_id"] = spec.run_id
         payload["adapter_id"] = spec.adapter_id
+        payload["experiment_id"] = spec.experiment_id
+        payload["arm"] = spec.arm
+        payload["prompt_version"] = spec.prompt_version
+        payload["context_package_id"] = spec.context.package_id
         self.ledger.append(
             Event.create(
                 stream_id=result.call_id,

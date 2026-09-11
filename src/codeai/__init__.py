@@ -14,6 +14,7 @@ from .adapters import (
     FakeCognitionAdapter,
     VerificationAdapter,
 )
+from .analysis import build_report, export_experiment, render_report
 from .artifacts import ArtifactCorruptionError, FileArtifactStore
 from .claims import disagreement_report, project_claims, project_relationships
 from .context import (
@@ -25,6 +26,7 @@ from .context import (
     RequiredContextMissing,
     TraceEntry,
 )
+from .corpus import CORPUS_VERSION, CorpusTask, seeded_corpus, visible_prompt
 from .domain import (
     ActorRef,
     ArtifactRef,
@@ -45,16 +47,37 @@ from .domain import (
 from .domain import (
     CallSpec as CallSpecAlias,
 )
+from .experiments import (
+    ArmDef,
+    ExperimentBudget,
+    ExperimentConfig,
+    build_config,
+    create_experiment,
+    get_experiment,
+    plan_experiment,
+    run_arm,
+)
 from .ledger import ArtifactRecord, Event, SQLiteLedger
+from .modelconfig import ModelConfig, ModelMapping, load_model_config
+from .providers import (
+    AnthropicAdapter,
+    MissingCredentialsError,
+    OpenAIAdapter,
+    OpenAICompatibleAdapter,
+    ProviderError,
+)
 from .runtime import PreconditionMismatch, Runtime, default_repository_state_hash
 from .scheduler import Operation, SchedulerDecision, SchedulerInput, decide_next_step
 from .verifier import LocalCommandVerifier
 
 __all__ = [
+    "CORPUS_VERSION",
     "ActionRequest",
     "ActionResult",
     "ActionStatus",
     "ActorRef",
+    "AnthropicAdapter",
+    "ArmDef",
     "ArtifactCorruptionError",
     "ArtifactRecord",
     "ArtifactRef",
@@ -77,16 +100,25 @@ __all__ = [
     "ContextCompiler",
     "ContextPackage",
     "ContextSealViolation",
+    "CorpusTask",
     "Decision",
     "Directive",
     "Event",
     "EvidenceClass",
     "ExecutionAdapter",
+    "ExperimentBudget",
+    "ExperimentConfig",
     "FakeCognitionAdapter",
     "FileArtifactStore",
     "LocalCommandVerifier",
+    "MissingCredentialsError",
+    "ModelConfig",
+    "ModelMapping",
+    "OpenAIAdapter",
+    "OpenAICompatibleAdapter",
     "Operation",
     "PreconditionMismatch",
+    "ProviderError",
     "RequiredContextMissing",
     "Runtime",
     "SQLiteLedger",
@@ -97,9 +129,20 @@ __all__ = [
     "TraceEntry",
     "Variant",
     "VerificationAdapter",
+    "build_config",
+    "build_report",
+    "create_experiment",
     "decide_next_step",
     "default_repository_state_hash",
     "disagreement_report",
+    "export_experiment",
+    "get_experiment",
+    "load_model_config",
+    "plan_experiment",
     "project_claims",
     "project_relationships",
+    "render_report",
+    "run_arm",
+    "seeded_corpus",
+    "visible_prompt",
 ]

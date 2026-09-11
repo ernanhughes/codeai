@@ -75,6 +75,46 @@ def build_parser() -> argparse.ArgumentParser:
     context_show = context_sub.add_parser("show", help="show one context package by hash")
     context_show.add_argument("hash")
 
+    models_cmd = sub.add_parser("models", help="inspect logical model/provider mapping")
+    models_sub = models_cmd.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser("list", help="show configured models and missing credentials")
+    models_init = models_sub.add_parser("init", help="write example .codeai/config.toml")
+    models_init.add_argument("--force", action="store_true")
+
+    exp = sub.add_parser("experiment", help="controlled C0/C1/H1 experiments")
+    exp_sub = exp.add_subparsers(dest="experiment_command", required=True)
+
+    exp_create = exp_sub.add_parser("create", help="preregister a versioned experiment")
+    exp_create.add_argument("--name", required=True)
+    exp_create.add_argument("--hypothesis", required=True)
+    exp_create.add_argument("--tasks", default="all", help="'all' or comma-separated corpus task ids")
+    exp_create.add_argument("--primary-metric", default="verified oracle@k")
+    exp_create.add_argument("--c0", default=None, help="logical model for C0 baseline")
+    exp_create.add_argument("--c1", default=None, help="logical model for C1 homogeneous arm")
+    exp_create.add_argument("--c1-samples", type=int, default=3)
+    exp_create.add_argument("--h1", default=None, help="comma-separated logical models for H1")
+    exp_create.add_argument("--h1-samples", type=int, default=3)
+    exp_create.add_argument("--max-calls", type=int, default=None)
+    exp_create.add_argument("--max-cost", type=float, default=None)
+    exp_create.add_argument("--timeout", type=float, default=60.0)
+    exp_create.add_argument("--dry-run", action="store_true")
+
+    exp_run = exp_sub.add_parser("run", help="run one experiment arm")
+    exp_run.add_argument("--experiment", required=True)
+    exp_run.add_argument("--arm", required=True, choices=["C0", "C1", "H1"])
+    exp_run.add_argument("--tasks", default=None, help="optional subset of corpus task ids")
+    exp_run.add_argument("--candidates-dir", default=None)
+    exp_run.add_argument("--dry-run", action="store_true")
+
+    exp_report = exp_sub.add_parser("report", help="deterministic experiment report")
+    exp_report.add_argument("experiment_id")
+
+    exp_export = exp_sub.add_parser("export", help="export raw experiment observations as JSON")
+    exp_export.add_argument("experiment_id")
+    exp_export.add_argument("--out", default=None)
+
+    exp_sub.add_parser("list", help="list experiments")
+
     oc = sub.add_parser("opencode", help="send one bounded instruction to OpenCode")
     oc.add_argument("instruction")
     oc.add_argument("--url", default=os.getenv("OPENCODE_URL", "http://127.0.0.1:4096"))
@@ -248,6 +288,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"context not found: {args.hash}", file=sys.stderr)
         return 1
 
+    if args.command == "models":
+        from .modelconfig import (
+            EXAMPLE_CONFIG,
+            default_config_path,
+            load_model_config,
+            missing_credentials,
+        )
+
+        if args.models_command == "init":
+            path = default_config_path(Path.cwd())
+            if path.exists() and not args.force:
+                print(f"exists: {path} (use --force to overwrite)", file=sys.stderr)
+                return 1
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        config = load_model_config()
+        if not config.models:
+            print("no models configured; run `codeai models init`")
+            return 0
+        for name in sorted(config.models):
+            mapping = config.models[name]
+            missing = missing_credentials(mapping)
+            status = f"MISSING: {missing}" if missing else "ok"
+            print(f"{name}: adapter={mapping.adapter} model={mapping.model} {status}")
+        return 0
+
+    if args.command == "experiment":
+        return _experiment_command(runtime, args)
+
     if args.command == "opencode":
         task = ensure_task(runtime, args.instruction, args.task)
         client_kwargs = {"username": args.username}
@@ -340,6 +411,121 @@ def ensure_task(runtime: Runtime, instruction: str, task_id: str | None) -> Task
             parent_task_id=event.payload.get("parent_task_id"),
         )
     raise ValueError(f"task not found: {task_id}")
+
+
+def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
+    import json as _json
+
+    from .analysis import build_report, export_experiment, render_report
+    from .corpus import seeded_corpus
+    from .experiments import (
+        ArmDef,
+        ExperimentBudget,
+        build_config,
+        create_experiment,
+        get_experiment,
+        plan_experiment,
+        run_arm,
+    )
+    from .modelconfig import load_model_config
+
+    if args.experiment_command == "list":
+        for event in runtime.ledger.events_by_kind(("experiment.created",)):
+            print(f"{event.payload['experiment_id']}  {event.payload['name']}")
+        return 0
+
+    if args.experiment_command == "create":
+        corpus = seeded_corpus()
+        available = {t.task_id for t in corpus}
+        if args.tasks == "all":
+            task_ids = tuple(t.task_id for t in corpus)
+        else:
+            task_ids = tuple(t.strip() for t in args.tasks.split(",") if t.strip())
+            unknown = set(task_ids) - available
+            if unknown:
+                print(f"unknown corpus tasks: {sorted(unknown)}", file=sys.stderr)
+                return 1
+        arms: list[ArmDef] = []
+        if args.c0:
+            arms.append(ArmDef(name="C0", models=(args.c0,), samples=1))
+        if args.c1:
+            arms.append(ArmDef(name="C1", models=(args.c1,), samples=args.c1_samples))
+        if args.h1:
+            models = tuple(m.strip() for m in args.h1.split(",") if m.strip())
+            arms.append(ArmDef(name="H1", models=models, samples=args.h1_samples))
+        if not arms:
+            print("define at least one arm: --c0, --c1, or --h1", file=sys.stderr)
+            return 1
+        config = build_config(
+            name=args.name,
+            hypothesis=args.hypothesis,
+            primary_metric=args.primary_metric,
+            task_ids=task_ids,
+            arms=tuple(arms),
+            budget=ExperimentBudget(
+                max_calls=args.max_calls, max_cost_usd=args.max_cost,
+                timeout_seconds=args.timeout),
+        )
+        model_config = load_model_config()
+        plan = plan_experiment(config, model_config, corpus_tasks=corpus)
+        if args.dry_run:
+            print(_json.dumps(plan, indent=2, sort_keys=True))
+            return 0
+        create_experiment(runtime, config)
+        print(f"experiment_id: {config.experiment_id}")
+        print(f"config_hash: {config.config_hash}")
+        print(f"tasks: {len(task_ids)} arms: {[a.name for a in arms]}")
+        return 0
+
+    if args.experiment_command == "run":
+        config = get_experiment(runtime, args.experiment)
+        if config is None:
+            print(f"unknown experiment: {args.experiment}", file=sys.stderr)
+            return 1
+        corpus = seeded_corpus()
+        wanted = set(args.tasks.split(",") if args.tasks else config.task_ids)
+        tasks = tuple(t for t in corpus if t.task_id in wanted)
+        if not tasks:
+            print("no matching corpus tasks", file=sys.stderr)
+            return 1
+        model_config = load_model_config()
+        plan = plan_experiment(config, model_config, corpus_tasks=tasks)
+        if args.dry_run:
+            print(_json.dumps(plan, indent=2, sort_keys=True))
+            return 0
+        before = len(runtime.ledger.read_all())
+        candidates_dir = Path(args.candidates_dir) if args.candidates_dir else Path.cwd() / ".codeai" / "candidates"
+        summary = run_arm(
+            runtime, args.experiment, args.arm, tasks, model_config,
+            candidates_root=candidates_dir)
+        print(f"arm: {summary['arm']} completed_tasks: {summary['completed_tasks']}")
+        if summary["stopped"]:
+            print(f"stopped: {summary['stopped']}")
+        print(f"events_added: {len(runtime.ledger.read_all()) - before}")
+        return 0
+
+    if args.experiment_command == "report":
+        try:
+            print(render_report(build_report(runtime, args.experiment_id)), end="")
+        except KeyError:
+            print(f"unknown experiment: {args.experiment_id}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.experiment_command == "export":
+        try:
+            payload = export_experiment(runtime, args.experiment_id)
+        except KeyError:
+            print(f"unknown experiment: {args.experiment_id}", file=sys.stderr)
+            return 1
+        text = _json.dumps(payload, indent=2, sort_keys=True, default=str)
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(f"wrote {args.out}")
+        else:
+            print(text)
+        return 0
+    return 2
 
 
 if __name__ == "__main__":
