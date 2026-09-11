@@ -75,15 +75,10 @@ ruff check .
 
 ## What comes next
 
-The next implementation slice should be empirical rather than ornamental:
-
-1. content-addressed artifact storage;
-2. call/result recording and idempotency;
-3. claim extraction as a derived projection;
-4. an isolated command verifier;
-5. an OpenCode execution adapter;
-6. a simple CLI control surface;
-7. the first experiment: **same-model repeated sampling vs heterogeneous sampling at matched cost**.
+The execution slice is done (artifacts, action/check idempotency, OpenCode adapter,
+durable runs). The current slice is empirical: **same-model repeated sampling (C1)
+vs heterogeneous sampling (H1) at matched cost**, with independent contexts and
+external verification.
 
 The browser extension belongs on top of this runtime as a control surface. It should transport interaction, display state, and submit directives; it should not own the intellectual history of the work.
 
@@ -134,3 +129,53 @@ codeai run show <run-id>
 ```
 
 The existing OpenCode path is preserved, but now records append-only action requests and results in the local ledger before returning control to the human.
+
+## Epistemic collaboration runtime
+
+Boundaries (code-aligned):
+
+```text
+Control surface  conversation, CLI; transports intent, owns nothing durable
+Runtime state    append-only SQLite ledger (.codeai/ledger.sqlite); authoritative
+Cognition        CognitionAdapter.invoke(CallSpec) -> CallResult; observation, not truth
+Execution        ExecutionAdapter (OpenCode/...); side effects with authority + preconditions
+Verification     VerificationAdapter; deterministic checks with PASS/FAIL/ERROR
+Epistemic state  claim/relationship projections over ledgered facts
+```
+
+Pipeline:
+
+```text
+raw output (immutable artifact)
+  -> claim (atomic assertion, anchored to source span)
+  -> evidence (E0 ASSERTED ... E4 ROBUST; only scoped checks promote)
+  -> decision (relies on explicit claim ids)
+```
+
+Invariants:
+
+- `agreement != evidence`: concurrence (N sealed calls asserting alike) never upgrades evidence class.
+- `conversation != state`: only ledgered events, packages, traces, and artifacts are replayable state.
+- Authority seam: `requested_by` (who authorized) vs `actor_id` (who executed) vs `adapter_id` (transport).
+- Repository precondition: `HEAD + staged diff + unstaged diff + untracked path list`; planned-vs-observed mismatch fails loudly.
+- Context packages are immutable, deterministically ordered/hashed, budget-aware, and carry a compilation trace (`candidate -> included because ... / excluded because seal|budget`). Required items never silently degrade (`REQUIRED_CONTEXT_MISSING`, `CONTEXT_BUDGET_UNSATISFIABLE`).
+- Seals are lineage-aware: sealing call B excludes Claim B1 and summaries derived from B1, not just the call event.
+
+CLI:
+
+```bash
+codeai run create "Investigate bug X"
+codeai fanout --run <id> --task <id> --prompt "..." --count 3 --models qwen,claude,gpt --experiment H1
+codeai call --task <id> --prompt "..." --model fake-model
+codeai claims <run-id>     # concurrence vs contradicted vs unresolved
+codeai checks <run-id>
+codeai context show <package-or-trace-hash>
+```
+
+First experiment now possible: C1 (`--experiment C1 --models same --count N`) vs H1
+(`--experiment H1 --models a,b,c`) on the same base prompt/context; the ledger yields
+cost, latency, success/failure, verification outcome, unique rescues, and concurrence.
+
+Deliberately deferred: automated synthesis, debate loops, learned routing/bandits,
+web dashboard, browser extension, graph/vector DBs, autonomous loops, majority-vote
+decision making, model-judge-as-truth.

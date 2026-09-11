@@ -4,18 +4,35 @@ from .adapters import (
     ActionRequest,
     ActionResult,
     ActionStatus,
+    CallResult,
+    CallSpec,
     CheckRequest,
     CheckResult,
     CheckVerdict,
+    CognitionAdapter,
+    ExecutionAdapter,
+    FakeCognitionAdapter,
+    VerificationAdapter,
 )
 from .artifacts import ArtifactCorruptionError, FileArtifactStore
+from .claims import disagreement_report, project_claims, project_relationships
+from .context import (
+    CompilationTrace,
+    ContextBudgetUnsatisfiable,
+    ContextCandidate,
+    ContextCompiler,
+    ContextSealViolation,
+    RequiredContextMissing,
+    TraceEntry,
+)
 from .domain import (
     ActorRef,
     ArtifactRef,
     Authority,
     Budget,
-    CallSpec,
     Claim,
+    ClaimRelationship,
+    ClaimRelationshipType,
     ClaimStatus,
     ContextPackage,
     Decision,
@@ -23,9 +40,14 @@ from .domain import (
     EvidenceClass,
     Seal,
     Task,
+    Variant,
+)
+from .domain import (
+    CallSpec as CallSpecAlias,
 )
 from .ledger import ArtifactRecord, Event, SQLiteLedger
 from .runtime import PreconditionMismatch, Runtime, default_repository_state_hash
+from .scheduler import Operation, SchedulerDecision, SchedulerInput, decide_next_step
 from .verifier import LocalCommandVerifier
 
 __all__ = [
@@ -38,23 +60,46 @@ __all__ = [
     "ArtifactRef",
     "Authority",
     "Budget",
+    "CallResult",
     "CallSpec",
+    "CallSpecAlias",
     "CheckRequest",
     "CheckResult",
     "CheckVerdict",
     "Claim",
+    "ClaimRelationship",
+    "ClaimRelationshipType",
     "ClaimStatus",
+    "CognitionAdapter",
+    "CompilationTrace",
+    "ContextBudgetUnsatisfiable",
+    "ContextCandidate",
+    "ContextCompiler",
     "ContextPackage",
+    "ContextSealViolation",
     "Decision",
     "Directive",
     "Event",
     "EvidenceClass",
+    "ExecutionAdapter",
+    "FakeCognitionAdapter",
     "FileArtifactStore",
     "LocalCommandVerifier",
+    "Operation",
     "PreconditionMismatch",
+    "RequiredContextMissing",
     "Runtime",
     "SQLiteLedger",
+    "SchedulerDecision",
+    "SchedulerInput",
     "Seal",
     "Task",
+    "TraceEntry",
+    "Variant",
+    "VerificationAdapter",
+    "decide_next_step",
     "default_repository_state_hash",
+    "disagreement_report",
+    "project_claims",
+    "project_relationships",
 ]

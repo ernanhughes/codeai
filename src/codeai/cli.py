@@ -46,6 +46,35 @@ def build_parser() -> argparse.ArgumentParser:
     run_show = run_sub.add_parser("show", help="show one durable run")
     run_show.add_argument("run_id")
 
+    call = sub.add_parser("call", help="record one isolated cognition call (fake adapter)")
+    call.add_argument("--task", required=True)
+    call.add_argument("--run", default=None)
+    call.add_argument("--prompt", required=True)
+    call.add_argument("--actor", default="model-a")
+    call.add_argument("--provider", default="fake-provider")
+    call.add_argument("--model", default="fake-model")
+    call.add_argument("--response", default=None)
+    call.add_argument("--experiment", default=None)
+
+    fanout = sub.add_parser("fanout", help="sealed blind fanout of N independent calls")
+    fanout.add_argument("--task", required=True)
+    fanout.add_argument("--run", default=None)
+    fanout.add_argument("--prompt", required=True)
+    fanout.add_argument("--count", type=int, default=2)
+    fanout.add_argument("--models", default="fake-model")
+    fanout.add_argument("--experiment", default=None)
+
+    claims_cmd = sub.add_parser("claims", help="show claims and concurrence for a run")
+    claims_cmd.add_argument("run_id")
+
+    checks_cmd = sub.add_parser("checks", help="list checks for a run")
+    checks_cmd.add_argument("run_id")
+
+    context_cmd = sub.add_parser("context", help="inspect compiled context")
+    context_sub = context_cmd.add_subparsers(dest="context_command", required=True)
+    context_show = context_sub.add_parser("show", help="show one context package by hash")
+    context_show.add_argument("hash")
+
     oc = sub.add_parser("opencode", help="send one bounded instruction to OpenCode")
     oc.add_argument("instruction")
     oc.add_argument("--url", default=os.getenv("OPENCODE_URL", "http://127.0.0.1:4096"))
@@ -92,7 +121,132 @@ def main(argv: list[str] | None = None) -> int:
             print("checks:")
             for check in run["checks"]:
                 print(f"  - {check['check_id']}: {check['verdict']}")
+            print("calls:")
+            for call_payload in run.get("calls", ()):
+                print(
+                    f"  - {call_payload['call_id']}: {call_payload.get('status')} "
+                    f"model={call_payload.get('model')} cost={call_payload.get('cost_usd')}"
+                )
+            print("claims:")
+            for claim in run.get("claims", ()):
+                print(f"  - {claim['claim_id']}: {claim['statement'][:80]} [{claim.get('evidence_class')}]")
             return 0
+
+    if args.command == "call":
+        from .adapters import CallSpec, FakeCognitionAdapter
+        from .context import ContextCompiler
+        from .domain import ActorRef, Variant
+
+        task = ensure_task(runtime, args.prompt, args.task)
+        actor = ActorRef(
+            actor_id=args.actor, kind="model", provider=args.provider, model=args.model
+        )
+        package, _trace = ContextCompiler().compile_with_trace(
+            task_id=task.task_id, actor=actor, prompt=args.prompt, events=()
+        )
+        adapter = FakeCognitionAdapter(
+            responses=[args.response] if args.response else None,
+            provider=args.provider,
+            model=args.model,
+        )
+        spec = CallSpec(
+            call_id=str(uuid.uuid4()),
+            task_id=task.task_id,
+            actor=actor,
+            context=package,
+            idempotency_key=str(uuid.uuid4()),
+            directive_id=task.directive_id,
+            run_id=args.run or task.directive_id,
+            adapter_id=args.provider,
+            instruction=args.prompt,
+            variant=Variant(
+                model=args.model, provider=args.provider, experiment=args.experiment
+            ),
+        )
+        result = runtime.invoke_call(spec, adapter=adapter)
+        print(f"call_id: {result.call_id}")
+        print(f"status: {result.status}")
+        print(f"model: {result.model}")
+        print(f"cost_usd: {result.cost_usd}")
+        print(f"raw_output: {result.raw_output[:500]}")
+        return 0 if result.status == "succeeded" else 1
+
+    if args.command == "fanout":
+        from .adapters import FakeCognitionAdapter
+        from .domain import ActorRef, Variant
+
+        task = ensure_task(runtime, args.prompt, args.task)
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        branches = []
+        for i in range(args.count):
+            model = models[i % len(models)]
+            branches.append(
+                {
+                    "actor": ActorRef(
+                        actor_id=f"{model}-{i}", kind="model", provider="fake-provider", model=model
+                    ),
+                    "adapter": FakeCognitionAdapter(
+                        responses=[f"fake output branch {i}"],
+                        provider="fake-provider",
+                        model=model,
+                    ),
+                    "adapter_id": "fake-provider",
+                    "variant": Variant(model=model, provider="fake-provider", experiment=args.experiment),
+                    "prompt": args.prompt,
+                }
+            )
+        results = runtime.sealed_fanout(
+            task_id=task.task_id,
+            base_prompt=args.prompt,
+            branches=branches,
+            directive_id=task.directive_id,
+            run_id=args.run or task.directive_id,
+        )
+        for result in results:
+            print(f"{result.call_id}: {result.status} model={result.model}")
+        return 0
+
+    if args.command == "claims":
+        report = runtime.disagreement_for_run(args.run_id)
+        print(f"run_id: {args.run_id}")
+        print("concurrence (agreement != evidence):")
+        for entry in report["concurrence"]:  # type: ignore[index]
+            print(f"  - {entry['statement'][:100]} x{entry['concurrence']} sources={entry['sources']}")
+        print("unique:")
+        for entry in report["unique"]:  # type: ignore[index]
+            print(f"  - {entry['statement'][:100]}")
+        print("contradicted:")
+        for claim in report["contradicted"]:  # type: ignore[index]
+            print(f"  - {claim['claim_id']}: {claim['statement'][:100]}")
+        print("unresolved:")
+        for claim in report["unresolved"]:  # type: ignore[index]
+            print(f"  - {claim['claim_id']}: {claim['statement'][:100]}")
+        return 0
+
+    if args.command == "checks":
+        run = runtime.show_run(args.run_id)
+        if run is None:
+            print(f"run not found: {args.run_id}", file=sys.stderr)
+            return 1
+        for check in run["checks"]:
+            print(f"  - {check['check_id']}: {check['verdict']}")
+        return 0
+
+    if args.command == "context" and args.context_command == "show":
+        for event in runtime.ledger.events_by_kind(("context.compiled",)):
+            if str(event.payload.get("package_id", "")) != args.hash and str(event.payload.get("trace_id", "")) != args.hash:
+                continue
+            print(f"package_id: {event.payload['package_id']}")
+            print(f"task_id: {event.payload['task_id']}")
+            print(f"events: {event.payload['event_ids']}")
+            print(f"artifacts: {event.payload['artifact_ids']}")
+            print(f"claims: {event.payload['claim_ids']}")
+            print("trace:")
+            for entry in event.payload["trace"]:
+                print(f"  - {entry['candidate_id']}: {entry['decision']} ({entry['reason']})")
+            return 0
+        print(f"context not found: {args.hash}", file=sys.stderr)
+        return 1
 
     if args.command == "opencode":
         task = ensure_task(runtime, args.instruction, args.task)
@@ -105,8 +259,10 @@ def main(argv: list[str] | None = None) -> int:
                 action_id=str(uuid.uuid4()),
                 directive_id=task.directive_id,
                 task_id=task.task_id,
-                actor_id="human",
+                requested_by="human",
+                actor_id="opencode",
                 adapter="opencode",
+                adapter_id="opencode",
                 capability=Capability.EXECUTE.value,
                 instruction=args.instruction,
                 precondition_hash=default_repository_state_hash(Path.cwd()),

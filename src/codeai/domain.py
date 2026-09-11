@@ -15,12 +15,24 @@ class EvidenceClass(StrEnum):
 
 
 class ClaimStatus(StrEnum):
-    OPEN = "open"
-    CONTESTED = "contested"
+    ASSERTED = "asserted"
     SUPPORTED = "supported"
     REFUTED = "refuted"
+    CONTESTED = "contested"
+    UNRESOLVED = "unresolved"
     UNVERIFIABLE = "unverifiable"
     SUPERSEDED = "superseded"
+    # Legacy alias: early v0 used OPEN for newly asserted claims.
+    OPEN = "open"
+
+
+class ClaimRelationshipType(StrEnum):
+    SAME_AS = "SAME_AS"
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    DEPENDS_ON = "DEPENDS_ON"
+    DERIVED_FROM = "DERIVED_FROM"
+    TESTED_BY = "TESTED_BY"
 
 
 class Capability(StrEnum):
@@ -113,10 +125,25 @@ class Claim:
     statement: str
     source_call_id: str
     evidence_class: EvidenceClass = EvidenceClass.ASSERTED
-    status: ClaimStatus = ClaimStatus.OPEN
+    status: ClaimStatus = ClaimStatus.ASSERTED
     scope: str | None = None
     anchors: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
+    # Epistemic-collaboration extensions (all optional for backward compatibility).
+    run_id: str | None = None
+    source_artifact_id: str | None = None
+    source_span: str | None = None
+    conditions: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRelationship:
+    relationship_id: str
+    from_claim_id: str
+    to_claim_id: str
+    relationship_type: ClaimRelationshipType
+    run_id: str | None = None
+    created_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +159,28 @@ class Decision:
 class Seal:
     forbidden_event_ids: frozenset[str] = frozenset()
     forbidden_call_ids: frozenset[str] = frozenset()
+    forbidden_artifact_ids: frozenset[str] = frozenset()
+    forbidden_lineage_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class Variant:
+    """Diversity-source metadata: why two calls differ.
+
+    Small tag structure sufficient to distinguish the first experiments:
+    same model x N vs heterogeneous models x N, prompt/temperature/context variants.
+    """
+
+    model: str | None = None
+    provider: str | None = None
+    prompt_variant: str | None = None
+    temperature: float | None = None
+    seed: str | None = None
+    context_variant: str | None = None
+    tool_variant: str | None = None
+    evidence_partition: str | None = None
+    experiment: str | None = None
+    tags: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +193,13 @@ class ContextPackage:
     artifact_ids: tuple[str, ...] = ()
     seal: Seal = field(default_factory=Seal)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Epistemic extensions (optional, backward compatible).
+    objective: str | None = None
+    claim_ids: tuple[str, ...] = ()
+    budget_tokens: int | None = None
+    prompt_version: str | None = None
+    trace_hash: str | None = None
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,3 +211,12 @@ class CallSpec:
     idempotency_key: str
     pattern: str = "single"
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    # Epistemic-collaboration extensions.
+    directive_id: str | None = None
+    run_id: str | None = None
+    adapter_id: str | None = None
+    instruction: str = ""
+    prompt_version: str | None = None
+    budget: Budget | None = None
+    variant: Variant = field(default_factory=Variant)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
