@@ -1,5 +1,14 @@
 """codeai: a durable epistemic runtime for AI collaboration."""
 
+from .adapters import (
+    ActionRequest,
+    ActionResult,
+    ActionStatus,
+    CheckRequest,
+    CheckResult,
+    CheckVerdict,
+)
+from .artifacts import ArtifactCorruptionError, FileArtifactStore
 from .domain import (
     ActorRef,
     ArtifactRef,
@@ -15,22 +24,37 @@ from .domain import (
     Seal,
     Task,
 )
-from .ledger import Event, SQLiteLedger
+from .ledger import ArtifactRecord, Event, SQLiteLedger
+from .runtime import PreconditionMismatch, Runtime, default_repository_state_hash
+from .verifier import LocalCommandVerifier
 
 __all__ = [
+    "ActionRequest",
+    "ActionResult",
+    "ActionStatus",
     "ActorRef",
+    "ArtifactCorruptionError",
+    "ArtifactRecord",
     "ArtifactRef",
     "Authority",
     "Budget",
     "CallSpec",
+    "CheckRequest",
+    "CheckResult",
+    "CheckVerdict",
     "Claim",
     "ClaimStatus",
     "ContextPackage",
     "Decision",
     "Directive",
-    "EvidenceClass",
     "Event",
+    "EvidenceClass",
+    "FileArtifactStore",
+    "LocalCommandVerifier",
+    "PreconditionMismatch",
+    "Runtime",
     "SQLiteLedger",
     "Seal",
     "Task",
+    "default_repository_state_hash",
 ]

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any
 
 
 class EvidenceClass(StrEnum):
@@ -48,7 +49,7 @@ class Budget:
     max_turns: int | None = None
     max_human_minutes: int | None = None
 
-    def narrows(self, parent: "Budget") -> bool:
+    def narrows(self, parent: Budget) -> bool:
         pairs = (
             (self.max_tokens, parent.max_tokens),
             (self.max_cost_usd, parent.max_cost_usd),
@@ -66,7 +67,7 @@ class Authority:
     def allows(self, capability: Capability) -> bool:
         return capability in self.capabilities
 
-    def narrows(self, parent: "Authority") -> bool:
+    def narrows(self, parent: Authority) -> bool:
         return self.capabilities.issubset(parent.capabilities)
 
 
@@ -79,7 +80,7 @@ class Directive:
     authority: Authority
     parent_directive_id: str | None = None
 
-    def validate_child(self, child: "Directive") -> None:
+    def validate_child(self, child: Directive) -> None:
         if not child.budget.narrows(self.budget):
             raise ValueError("child directive budget must narrow the parent budget")
         if not child.authority.narrows(self.authority):

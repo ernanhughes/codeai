@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from codeai.ledger import Event, SQLiteLedger
@@ -18,5 +20,5 @@ def test_event_ids_are_unique():
     ledger = SQLiteLedger()
     event = Event.create(stream_id="d1", kind="x", actor_id="a", payload={})
     ledger.append(event)
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.IntegrityError):
         ledger.append(event)

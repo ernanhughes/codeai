@@ -87,6 +87,20 @@ The next implementation slice should be empirical rather than ornamental:
 
 The browser extension belongs on top of this runtime as a control surface. It should transport interaction, display state, and submit directives; it should not own the intellectual history of the work.
 
+## Durable local state
+
+CodeAI now keeps durable local runtime state under:
+
+```text
+.codeai/
+  ledger.sqlite
+  artifacts/
+    ab/
+      abcdef...
+```
+
+Artifacts are content-addressed by SHA-256 and metadata is stored alongside the append-only ledger.
+
 ## First OpenCode path
 
 OpenCode currently exposes a headless HTTP server. Start it in the repository you want it to operate on:
@@ -108,3 +122,15 @@ codeai opencode --session <session-id> "Now propose the smallest fix."
 ```
 
 This direct CLI path is intentionally only a control surface. The next slice will record each OpenCode action, result, cost, artifacts, preconditions, and verification outcome in the ledger before we automate browser-to-browser loops.
+
+## Durable run CLI
+
+Create and inspect durable runs:
+
+```bash
+codeai run create "Fix the flaky writer-runtime test"
+codeai run list
+codeai run show <run-id>
+```
+
+The existing OpenCode path is preserved, but now records append-only action requests and results in the local ledger before returning control to the human.

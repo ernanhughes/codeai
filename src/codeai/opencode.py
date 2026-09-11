@@ -7,7 +7,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .adapters import ActionRequest, ActionResult, ExecutionAdapter
+from .adapters import ActionRequest, ActionResult, ActionStatus, ExecutionAdapter
 
 
 class OpenCodeError(RuntimeError):
@@ -68,7 +68,7 @@ class OpenCodeClient:
             f"{self.base_url}{path}", data=encoded, headers=headers, method=method
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:  # noqa: S310 localhost client
+            with urlopen(request, timeout=self.timeout) as response:
                 payload = response.read()
         except HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
@@ -97,7 +97,8 @@ class OpenCodeExecutionAdapter(ExecutionAdapter):
     def execute(self, request: ActionRequest) -> ActionResult:
         if self.session_id is None:
             self.session_id = self.client.create_session(title=self.session_title).session_id
-        response = self.client.prompt(self.session_id, request.instruction)
+        instruction = request.instruction or str(request.payload.get("instruction", ""))
+        response = self.client.prompt(self.session_id, instruction)
         text_parts = [
             str(part.get("text", ""))
             for part in response.get("parts", [])
@@ -105,7 +106,7 @@ class OpenCodeExecutionAdapter(ExecutionAdapter):
         ]
         return ActionResult(
             action_id=request.action_id,
-            status="completed",
+            status=ActionStatus.SUCCEEDED,
             transcript="\n".join(part for part in text_parts if part) or json.dumps(response),
             state_hash=self.session_id,
         )
