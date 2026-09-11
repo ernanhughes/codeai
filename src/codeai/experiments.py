@@ -286,10 +286,12 @@ def _budget_allows(config: ExperimentConfig, usage: dict[str, float], planned_ca
     return True, "ok"
 
 
-def starting_state_hash(task: CorpusTask) -> str:
-    return hashlib.sha256(
-        f"{CORPUS_VERSION}\0{task.task_id}\0{task.starter_code}\0{task.hidden_tests}".encode()
-    ).hexdigest()
+def starting_state_hash(task: CorpusTask, corpus_version: str = CORPUS_VERSION) -> str:
+    base = f"{corpus_version}\0{task.task_id}\0{task.starter_code}\0{task.hidden_tests}"
+    if task.support_files:
+        extra = "\0".join(f"{name}\0{content}" for name, content in sorted(task.support_files))
+        base += f"\0{extra}"
+    return hashlib.sha256(base.encode()).hexdigest()
 
 
 def run_arm(
@@ -364,7 +366,8 @@ def run_arm(
                 stream_id=task.task_id, kind="experiment.task_mapped", actor_id="runtime",
                 payload={"experiment_id": experiment_id, "arm": arm_name,
                          "task_id": task.task_id, "corpus_task_id": corpus_task.task_id,
-                         "starting_state_hash": starting_state_hash(corpus_task)},
+                         "starting_state_hash": starting_state_hash(
+                             corpus_task, config.corpus_version)},
                 correlation_id=experiment_id,
             )
         )
@@ -458,12 +461,17 @@ def _branch_params(arm: ArmDef, index: int) -> dict[str, Any]:
     return params
 
 
+def _corpus_version_for(runtime: Any, experiment_id: str) -> str:
+    config = get_experiment(runtime, experiment_id)
+    return config.corpus_version if config else CORPUS_VERSION
+
+
 def _verify_candidate(
     runtime: Any, experiment_id: str, arm: str, corpus_task: CorpusTask, task_id: str,
     result: Any, candidates_root: Path, verifier: Any, timeout: float,
 ) -> str:
     """Materialize in isolation, compile-check, hidden-verify, ledger everything."""
-    start_hash = starting_state_hash(corpus_task)
+    start_hash = starting_state_hash(corpus_task, _corpus_version_for(runtime, experiment_id))
     workdir = candidates_root / experiment_id / arm / corpus_task.task_id / result.call_id
     material = materialize_candidate(corpus_task, result.raw_output or "", workdir)
 

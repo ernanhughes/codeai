@@ -98,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     exp_create.add_argument("--max-cost", type=float, default=None)
     exp_create.add_argument("--timeout", type=float, default=60.0)
     exp_create.add_argument("--dry-run", action="store_true")
+    exp_create.add_argument("--corpus", default="seeded-code-v1",
+                            choices=["seeded-code-v1", "semantic-repair-v1"])
 
     exp_run = exp_sub.add_parser("run", help="run one experiment arm")
     exp_run.add_argument("--experiment", required=True)
@@ -105,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     exp_run.add_argument("--tasks", default=None, help="optional subset of corpus task ids")
     exp_run.add_argument("--candidates-dir", default=None)
     exp_run.add_argument("--dry-run", action="store_true")
+    exp_run.add_argument("--corpus", default=None,
+                         help="override corpus (default: experiment config version)")
 
     exp_report = exp_sub.add_parser("report", help="deterministic experiment report")
     exp_report.add_argument("experiment_id")
@@ -417,7 +421,8 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
     import json as _json
 
     from .analysis import build_report, export_experiment, render_report
-    from .corpus import seeded_corpus
+    from .corpus import CORPUS_VERSION, seeded_corpus
+    from .corpus_v2 import CORPUS2_VERSION, semantic_corpus
     from .experiments import (
         ArmDef,
         ExperimentBudget,
@@ -434,8 +439,16 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
             print(f"{event.payload['experiment_id']}  {event.payload['name']}")
         return 0
 
+    def _corpus_for(version: str) -> tuple:
+        if version == CORPUS2_VERSION:
+            return semantic_corpus()
+        if version == CORPUS_VERSION:
+            return seeded_corpus()
+        print(f"unknown corpus version: {version}", file=sys.stderr)
+        raise SystemExit(1)
+
     if args.experiment_command == "create":
-        corpus = seeded_corpus()
+        corpus = _corpus_for(args.corpus)
         available = {t.task_id for t in corpus}
         if args.tasks == "all":
             task_ids = tuple(t.task_id for t in corpus)
@@ -460,6 +473,7 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
             name=args.name,
             hypothesis=args.hypothesis,
             primary_metric=args.primary_metric,
+            corpus_version=args.corpus,
             task_ids=task_ids,
             arms=tuple(arms),
             budget=ExperimentBudget(
@@ -482,7 +496,7 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
         if config is None:
             print(f"unknown experiment: {args.experiment}", file=sys.stderr)
             return 1
-        corpus = seeded_corpus()
+        corpus = _corpus_for(args.corpus or config.corpus_version)
         wanted = set(args.tasks.split(",") if args.tasks else config.task_ids)
         tasks = tuple(t for t in corpus if t.task_id in wanted)
         if not tasks:

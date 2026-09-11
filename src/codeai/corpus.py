@@ -17,16 +17,28 @@ class CorpusTask:
     hidden_tests: str
     reference_solution: str
     expected_note: str
+    # v2 extensions (all defaulted; v1 tasks unaffected).
+    stratum: str = "local"
+    family: str = ""
+    support_files: tuple[tuple[str, str], ...] = ()
 
 
 def visible_prompt(task: CorpusTask) -> str:
     """What the model sees. Hidden tests and reference are never included."""
-    return (
-        f"{task.problem_statement}\n\n"
-        f"Current (buggy) code:\n```python\n{task.starter_code}\n```\n\n"
-        "Return the complete corrected module in a single ```python code block. "
-        "No explanation outside the block is required."
-    )
+    parts = [
+        task.problem_statement,
+        "",
+        "Current code:",
+        "```python",
+        task.starter_code,
+        "```",
+    ]
+    for filename, content in task.support_files:
+        parts += ["", f"Supporting module `{filename}` (read-only, do not reimplement):",
+                  "```python", content, "```"]
+    parts += ["", "Return the complete corrected `candidate.py` module in a single",
+              "```python code block. No explanation outside the block is required."]
+    return "\n".join(parts)
 
 
 def extract_code_block(raw_output: str) -> str | None:
@@ -42,10 +54,14 @@ def extract_code_block(raw_output: str) -> str | None:
 
 
 def materialize_candidate(task: CorpusTask, raw_output: str, workdir: str | Path) -> dict[str, object]:
-    """Write candidate.py + hidden_test.py into an isolated dir. No execution here."""
+    """Write candidate.py + support modules + hidden_test.py into an isolated dir."""
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     code = extract_code_block(raw_output)
+    for filename, content in task.support_files:
+        dest = workdir / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
     (workdir / "hidden_test.py").write_text(task.hidden_tests, encoding="utf-8")
     if code is None:
         return {"applies": False, "candidate_path": None, "reason": "no code block found"}
