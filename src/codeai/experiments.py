@@ -48,6 +48,10 @@ class ArmDef:
     temperature: float | None = None
     seed: str | None = None
     prompt_version: str | None = None
+    # Per-branch prompt design (cycled). Empty suffix = unmodified base prompt.
+    # Ledgered in the immutable config so prompt experiments stay reproducible.
+    prompt_suffixes: tuple[str, ...] = ()
+    stance_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +246,7 @@ def plan_experiment(
                 "samples": arm.samples,
                 "calls_planned": calls,
                 "prompt_version": arm.prompt_version,
+                "stances": sorted(set(arm.stance_labels)) or ["normal"],
             }
         )
     within_budget = True
@@ -373,10 +378,15 @@ def run_arm(
         )
 
         branches = []
+        suffixes = arm.prompt_suffixes or ("",)
+        stances = arm.stance_labels or ("normal",)
+        stance_counts: dict[str, int] = {}
         for i in range(planned):
             logical = branch_models[i % len(branch_models)]
             mapping = model_config.resolve(logical)
             adapter = model_config.build_adapter(logical)
+            stance = stances[i % len(stances)]
+            stance_counts[stance] = stance_counts.get(stance, 0) + 1
             branches.append(
                 {
                     "actor": ActorRef(actor_id=f"{actor_prefix}-{logical}-{i}", kind="model",
@@ -386,8 +396,10 @@ def run_arm(
                     "variant": {
                         "model": mapping.model, "provider": mapping.adapter,
                         "experiment": experiment_id,
+                        "stance": stance,
+                        "stance_sample": stance_counts[stance],
                     },
-                    "prompt": visible_prompt(corpus_task),
+                    "prompt": visible_prompt(corpus_task) + suffixes[i % len(suffixes)],
                     "parameters": _branch_params(arm, i),
                     "experiment_id": experiment_id,
                     "arm": arm_name,
@@ -401,8 +413,11 @@ def run_arm(
             assert isinstance(info, dict)
             branch["variant"] = VariantCls(
                 model=info["model"], provider=info["provider"], experiment=info["experiment"],
+                prompt_variant=str(info.get("stance", "normal")),
                 temperature=arm.temperature, seed=str(arm.seed) if arm.seed else None,
-                tags={"arm": arm_name, "logical_model": branch["actor"].model or ""},
+                tags={"arm": arm_name, "logical_model": branch["actor"].model or "",
+                      "stance": str(info.get("stance", "normal")),
+                      "stance_sample": str(info.get("stance_sample", 0))},
             )
 
         results = runtime.sealed_fanout(

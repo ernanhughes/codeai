@@ -69,11 +69,25 @@ from .providers import (
 )
 from .runtime import PreconditionMismatch, Runtime, default_repository_state_hash
 from .scheduler import Operation, SchedulerDecision, SchedulerInput, decide_next_step
+from .stances import (
+    ASSUMPTION_CHALLENGE,
+    COUNTERFACTUAL,
+    MINIMALITY,
+    NORMAL,
+    STANCES,
+    stance_prompt,
+    stance_suffix,
+)
 from .verifier import LocalCommandVerifier
 
 __all__ = [
+    "ASSUMPTION_CHALLENGE",
     "CORPUS2_VERSION",
     "CORPUS_VERSION",
+    "COUNTERFACTUAL",
+    "MINIMALITY",
+    "NORMAL",
+    "STANCES",
     "ActionRequest",
     "ActionResult",
     "ActionStatus",
@@ -148,5 +162,7 @@ __all__ = [
     "run_arm",
     "seeded_corpus",
     "semantic_corpus",
+    "stance_prompt",
+    "stance_suffix",
     "visible_prompt",
 ]
