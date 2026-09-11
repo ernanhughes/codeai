@@ -27,6 +27,7 @@ from .context import (
     TraceEntry,
 )
 from .corpus import CORPUS_VERSION, CorpusTask, seeded_corpus, visible_prompt
+from .corpus_v2 import CORPUS2_VERSION, get_v2_task, semantic_corpus
 from .domain import (
     ActorRef,
     ArtifactRef,
@@ -71,6 +72,7 @@ from .scheduler import Operation, SchedulerDecision, SchedulerInput, decide_next
 from .verifier import LocalCommandVerifier
 
 __all__ = [
+    "CORPUS2_VERSION",
     "CORPUS_VERSION",
     "ActionRequest",
     "ActionResult",
@@ -137,6 +139,7 @@ __all__ = [
     "disagreement_report",
     "export_experiment",
     "get_experiment",
+    "get_v2_task",
     "load_model_config",
     "plan_experiment",
     "project_claims",
@@ -144,5 +147,6 @@ __all__ = [
     "render_report",
     "run_arm",
     "seeded_corpus",
+    "semantic_corpus",
     "visible_prompt",
 ]
