@@ -1301,6 +1301,63 @@ class Runtime:
             response_body_artifact=body_artifact,
         )
 
+    def interpret_usage_as(self, attempt_id: str, *, version: str) -> dict[str, Any] | None:
+        """Project usage semantics over preserved evidence without appending.
+
+        Prefers the attempt's preserved transport body; falls back to the
+        legacy decoded envelope. Returns the evidence class and source hash
+        with the interpretation, or None when the attempt has no completed
+        record. Recorded usage and decisions are never modified.
+        """
+        from .usage_semantics import interpret_usage
+
+        completed = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("attempt.completed",))
+                if str(event.payload.get("attempt_id", "")) == attempt_id
+            ),
+            None,
+        )
+        if completed is None:
+            return None
+        parsed: dict[str, Any] = {}
+        evidence_class = "none"
+        source_sha256: str | None = None
+        observed = self.get_attempt_observation(attempt_id)
+        ref = observed.get("response_body_artifact") if observed else None
+        if isinstance(ref, dict) and self.artifact_store is not None:
+            try:
+                loaded = json.loads(self.artifact_store.read_bytes(str(ref["artifact_id"])))
+                source_sha256 = str(ref.get("sha256"))
+                if isinstance(loaded, dict):
+                    parsed, evidence_class = loaded, "transport_body"
+                else:
+                    evidence_class = "transport_body_not_object"
+            except (FileNotFoundError, KeyError, RuntimeError, ValueError):
+                evidence_class = "transport_body_unreadable"
+        if evidence_class == "none":
+            raw_ref = completed.payload.get("raw_artifact")
+            if isinstance(raw_ref, dict) and self.artifact_store is not None:
+                try:
+                    envelope = json.loads(self.artifact_store.read_text(str(raw_ref["artifact_id"])))
+                    provider_response = (
+                        envelope.get("provider_response") if isinstance(envelope, dict) else None
+                    )
+                    if isinstance(provider_response, dict):
+                        parsed, evidence_class = provider_response, "legacy_decoded_envelope"
+                        source_sha256 = str(raw_ref.get("sha256"))
+                except (FileNotFoundError, KeyError, RuntimeError, ValueError):
+                    pass
+        return {
+            "attempt_id": attempt_id,
+            "evidence_class": evidence_class,
+            "source_sha256": source_sha256,
+            "interpretation": interpret_usage(
+                completed.payload.get("protocol"), parsed, version=version
+            ),
+        }
+
     def project_call_as(
         self, call_id: str, *, interpreter_version: str, policy_version: str
     ) -> dict[str, Any] | None:
