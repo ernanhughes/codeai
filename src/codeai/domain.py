@@ -42,6 +42,9 @@ class Capability(StrEnum):
     VERSION_CONTROL = "version_control"
     REMOTE = "remote"
     DESTRUCTIVE = "destructive"
+    # Authority to accept a task's artifact as finished work (Stage 14).
+    # Deliberately separate from the capabilities that produce the work.
+    ACCEPT = "accept"
 
 
 class UsageSource(StrEnum):

@@ -11,6 +11,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .acceptance import (
+    AcceptanceRequest,
+    TaskCompletion,
+    project_task_completion,
+)
+from .acceptance import (
+    accept_task as _accept_task,
+)
 from .adapters import (
     NORMALIZER_VERSION,
     RAW_OBSERVATION_KIND,
@@ -288,6 +296,22 @@ class Runtime:
         self.ledger.append(event)
         self._apply_check_to_claims(request, result)
         return result
+
+    # ------------------------------------------------------------------
+    # Task acceptance: the only path to task.completed
+    # ------------------------------------------------------------------
+
+    def accept_task(self, request: AcceptanceRequest, *, authority: Authority) -> TaskCompletion:
+        """Accept an exact artifact for a task; see codeai.acceptance.
+
+        Raises AcceptanceRejected (after recording task.acceptance_rejected)
+        when any reference fails validation.
+        """
+        return _accept_task(self, request, authority=authority)
+
+    def task_completion(self, task_id: str) -> TaskCompletion:
+        """Project task completion from the ledger without appending."""
+        return project_task_completion(self, task_id)
 
     # ------------------------------------------------------------------
     # Cognition boundary: CallRequest -> CallResult -> artifact -> claims
