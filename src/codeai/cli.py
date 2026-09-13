@@ -104,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
     exp_create.add_argument("--h1-samples", type=int, default=3)
     exp_create.add_argument("--max-calls", type=int, default=None)
     exp_create.add_argument("--max-cost", type=float, default=None)
+    exp_create.add_argument(
+        "--allow-unknown-cost",
+        action="store_true",
+        help="explicit recorded override: continue while cost is unknown (cost stays UNKNOWN)",
+    )
+    exp_create.add_argument("--unknown-cost-reason", default=None)
     exp_create.add_argument("--timeout", type=float, default=60.0)
     exp_create.add_argument("--dry-run", action="store_true")
     exp_create.add_argument("--corpus", default="seeded-code-v1",
@@ -641,7 +647,9 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
             arms=tuple(arms),
             budget=ExperimentBudget(
                 max_calls=args.max_calls, max_cost_usd=args.max_cost,
-                timeout_seconds=args.timeout),
+                timeout_seconds=args.timeout,
+                allow_unknown_cost=args.allow_unknown_cost,
+                unknown_cost_reason=args.unknown_cost_reason),
         )
         model_config = load_model_config()
         plan = plan_experiment(config, model_config, corpus_tasks=corpus)

@@ -38,6 +38,38 @@ class ExperimentBudget:
     max_tokens: int | None = None
     max_cost_usd: float | None = None
     timeout_seconds: float = 60.0
+    # Explicit recorded override: when True, execution may continue while
+    # accumulated cost is unknown. Never converts unknown cost to zero; the
+    # override only permits proceeding, and is itself ledgered config evidence.
+    allow_unknown_cost: bool = False
+    unknown_cost_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentUsage:
+    """Experiment-level consumption with explicit completeness.
+
+    0 means measured zero; the `known_*` sums are lower bounds and the
+    `*_complete` flags say whether a complete total can be stated. Unknown
+    cost/tokens never silently become zero.
+    """
+
+    calls: int = 0
+    known_input_tokens: int = 0
+    known_output_tokens: int = 0
+    known_cost_usd: float = 0.0
+    input_complete: bool = True
+    output_complete: bool = True
+    cost_complete: bool = True
+    unknown_cost_calls: int = 0
+
+    @property
+    def tokens_complete(self) -> bool:
+        return self.input_complete and self.output_complete
+
+    @property
+    def known_tokens(self) -> int:
+        return self.known_input_tokens + self.known_output_tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,25 +302,199 @@ def plan_experiment(
     }
 
 
-def experiment_usage(runtime: Any, experiment_id: str) -> dict[str, float]:
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _attempt_usage(payload: dict[str, Any]) -> ExperimentUsage:
+    """Interpret one attempt.completed payload as consumption.
+
+    Per-attempt usage carries its own provenance: measured/estimated values
+    are known, unavailable values are unknown (None, never zero).
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return ExperimentUsage(calls=0, input_complete=False, output_complete=False,
+                               cost_complete=False, unknown_cost_calls=1)
+    source = str(usage.get("source", "unavailable") or "unavailable").lower()
+    known = source in ("measured", "estimated")
+    in_tokens = _optional_int(usage.get("input_tokens"))
+    out_tokens = _optional_int(usage.get("output_tokens"))
+    cost = _optional_float(payload.get("cost_usd"))
+    return ExperimentUsage(
+        calls=0,
+        known_input_tokens=in_tokens if known and in_tokens is not None else 0,
+        known_output_tokens=out_tokens if known and out_tokens is not None else 0,
+        known_cost_usd=cost or 0.0,
+        input_complete=known and in_tokens is not None,
+        output_complete=known and out_tokens is not None,
+        cost_complete=cost is not None,
+        unknown_cost_calls=0 if cost is not None else 1,
+    )
+
+
+def call_consumption(
+    payload: dict[str, Any], attempts: dict[str, dict[str, Any]] | None = None
+) -> ExperimentUsage:
+    """Interpret one call.completed payload as experiment consumption.
+
+    Preference order: (1) sum of the call's persisted attempt observations,
+    which preserves known lower bounds when some attempt is unknown; (2) the
+    recorded logical-call totals; (3) the legacy contract (integer token
+    fields are measurements, null cost stays unknown). No historical export
+    is rewritten and no certainty is manufactured.
+    """
+    attempt_ids = payload.get("attempt_ids")
+    if isinstance(attempt_ids, list) and attempt_ids and attempts is not None:
+        resolved = [attempts.get(str(aid)) for aid in attempt_ids]
+        if all(isinstance(entry, dict) for entry in resolved):
+            parts = [_attempt_usage(entry) for entry in resolved if isinstance(entry, dict)]
+            combined = combine_usage(parts)
+            return ExperimentUsage(
+                calls=1,
+                known_input_tokens=combined.known_input_tokens,
+                known_output_tokens=combined.known_output_tokens,
+                known_cost_usd=combined.known_cost_usd,
+                input_complete=combined.input_complete,
+                output_complete=combined.output_complete,
+                cost_complete=combined.cost_complete,
+                unknown_cost_calls=0 if combined.cost_complete else 1,
+            )
+    if (
+        "total_input_tokens" in payload
+        or "total_output_tokens" in payload
+        or "total_cost_usd" in payload
+    ):
+        total_in = _optional_int(payload.get("total_input_tokens"))
+        total_out = _optional_int(payload.get("total_output_tokens"))
+        total_cost = _optional_float(payload.get("total_cost_usd"))
+        return ExperimentUsage(
+            calls=1,
+            known_input_tokens=total_in or 0,
+            known_output_tokens=total_out or 0,
+            known_cost_usd=total_cost or 0.0,
+            input_complete=total_in is not None,
+            output_complete=total_out is not None,
+            cost_complete=total_cost is not None,
+            unknown_cost_calls=0 if total_cost is not None else 1,
+        )
+    legacy_in = _optional_int(payload.get("input_tokens", 0))
+    legacy_out = _optional_int(payload.get("output_tokens", 0))
+    legacy_cost = _optional_float(payload.get("cost_usd"))
+    return ExperimentUsage(
+        calls=1,
+        known_input_tokens=legacy_in or 0,
+        known_output_tokens=legacy_out or 0,
+        known_cost_usd=legacy_cost or 0.0,
+        input_complete=legacy_in is not None,
+        output_complete=legacy_out is not None,
+        cost_complete=legacy_cost is not None,
+        unknown_cost_calls=0 if legacy_cost is not None else 1,
+    )
+
+
+def combine_usage(parts: list[ExperimentUsage]) -> ExperimentUsage:
+    """Sum per-call consumption. Completeness is conjunctive: one unknown
+    leg makes the aggregate incomplete, while known lower bounds are kept."""
+    combined = ExperimentUsage()
+    for part in parts:
+        combined = ExperimentUsage(
+            calls=combined.calls + part.calls,
+            known_input_tokens=combined.known_input_tokens + part.known_input_tokens,
+            known_output_tokens=combined.known_output_tokens + part.known_output_tokens,
+            known_cost_usd=combined.known_cost_usd + part.known_cost_usd,
+            input_complete=combined.input_complete and part.input_complete,
+            output_complete=combined.output_complete and part.output_complete,
+            cost_complete=combined.cost_complete and part.cost_complete,
+            unknown_cost_calls=combined.unknown_cost_calls + part.unknown_cost_calls,
+        )
+    return combined
+
+
+def experiment_usage(runtime: Any, experiment_id: str) -> ExperimentUsage:
+    """Experiment consumption with explicit completeness.
+
+    Contract: missing cost is never interpreted as zero; logical-call totals
+    represent all recorded attempts; a partial measurement is not reported
+    as a complete total. See module contract below _budget_allows.
+    """
     calls = [
         e for e in runtime.ledger.events_by_kind(("call.completed",))
         if str(e.payload.get("experiment_id", "")) == experiment_id
     ]
-    tokens = sum(int(e.payload.get("input_tokens", 0) or 0) + int(e.payload.get("output_tokens", 0) or 0) for e in calls)
-    cost = sum(float(e.payload.get("cost_usd") or 0) for e in calls)
-    return {"calls": float(len(calls)), "tokens": float(tokens), "cost_usd": cost}
+    attempts = {
+        str(e.payload.get("attempt_id")): e.payload
+        for e in runtime.ledger.events_by_kind(("attempt.completed",))
+        if e.payload.get("attempt_id")
+    }
+    return combine_usage([call_consumption(e.payload, attempts) for e in calls])
 
 
-def _budget_allows(config: ExperimentConfig, usage: dict[str, float], planned_calls: int = 1) -> tuple[bool, str]:
+# --- Budget accounting contract -------------------------------------------
+# Experiment budget accounting never interprets missing cost as zero.
+# When a cost limit is active and accumulated cost is incomplete, execution
+# fails closed unless an explicit recorded override (ExperimentBudget
+# allow_unknown_cost, ledgered in the immutable experiment config plus a
+# budget.override event) permits continuation. Logical-call token totals
+# represent all recorded attempts; a partial measurement is not reported
+# as a complete total.
+
+
+def _budget_allows(
+    config: ExperimentConfig, usage: ExperimentUsage, planned_calls: int = 1
+) -> tuple[bool, str, str]:
+    """Decide whether the next planned work may proceed.
+
+    Returns (allowed, reason, budget_state) with budget_state in
+    {"ok", "exhausted", "unknown", "override"}. Threshold operators are
+    unchanged from the legacy rule: max_calls uses >, max_tokens and
+    max_cost_usd use >=. Unknown dimensions fail closed; only an explicit
+    recorded cost override permits continuation, without changing the
+    epistemic state (cost stays unknown).
+    """
     b = config.budget
-    if b.max_calls is not None and usage["calls"] + planned_calls > b.max_calls:
-        return False, f"max_calls {b.max_calls} would be exceeded"
-    if b.max_tokens is not None and usage["tokens"] >= b.max_tokens:
-        return False, f"max_tokens {b.max_tokens} exhausted"
-    if b.max_cost_usd is not None and usage["cost_usd"] >= b.max_cost_usd:
-        return False, f"max_cost_usd {b.max_cost_usd} exhausted"
-    return True, "ok"
+    if b.max_calls is not None and usage.calls + planned_calls > b.max_calls:
+        return False, f"max_calls {b.max_calls} would be exceeded", "exhausted"
+    if b.max_tokens is not None:
+        if usage.tokens_complete:
+            if usage.known_tokens >= b.max_tokens:
+                return False, f"max_tokens {b.max_tokens} exhausted", "exhausted"
+        elif usage.known_tokens >= b.max_tokens:
+            return False, f"max_tokens {b.max_tokens} exhausted", "exhausted"
+        else:
+            return (
+                False,
+                (f"cannot enforce max_tokens {b.max_tokens}: usage incomplete "
+                f"(known minimum {usage.known_tokens} tokens)"),
+                "unknown",
+            )
+    if b.max_cost_usd is not None:
+        if usage.cost_complete:
+            if usage.known_cost_usd >= b.max_cost_usd:
+                return False, f"max_cost_usd {b.max_cost_usd} exhausted", "exhausted"
+        elif b.allow_unknown_cost:
+            return (
+                True,
+                (f"proceeding under recorded unknown-cost override "
+                f"(known ${usage.known_cost_usd:.6f}, {usage.unknown_cost_calls} unknown-cost call(s))"),
+                "override",
+            )
+        else:
+            return (
+                False,
+                (f"cannot enforce max_cost_usd {b.max_cost_usd}: cost unknown for "
+                f"{usage.unknown_cost_calls} call(s); set allow_unknown_cost to override explicitly"),
+                "unknown",
+            )
+    return True, "ok", "ok"
 
 
 def starting_state_hash(task: CorpusTask, corpus_version: str = CORPUS_VERSION) -> str:
@@ -341,12 +547,36 @@ def run_arm(
     branch_models = _models_for_arm(arm)
     completed_tasks = 0
     stopped: dict[str, Any] | None = None
+    override_recorded = False
 
     for corpus_task in corpus_tasks:
         planned = branch_count(arm)
-        ok, reason = _budget_allows(config, experiment_usage(runtime, experiment_id), planned)
+        usage = experiment_usage(runtime, experiment_id)
+        ok, reason, budget_state = _budget_allows(config, usage, planned)
+        if budget_state == "override" and not override_recorded:
+            # The override changes permission to proceed, not epistemic
+            # state: cost remains unknown. Recorded once per arm run.
+            runtime.ledger.append(
+                Event.create(
+                    stream_id=experiment_id, kind="budget.override", actor_id="runtime",
+                    payload={
+                        "experiment_id": experiment_id,
+                        "arm": arm_name,
+                        "dimension": "cost",
+                        "reason": config.budget.unknown_cost_reason,
+                        "actor": "runtime",
+                        "known_state": {
+                            "known_cost_usd": usage.known_cost_usd,
+                            "unknown_cost_calls": usage.unknown_cost_calls,
+                            "calls": usage.calls,
+                        },
+                    },
+                    correlation_id=experiment_id,
+                )
+            )
+            override_recorded = True
         if not ok:
-            stopped = {"reason": BUDGET_STOPPED, "detail": reason,
+            stopped = {"reason": BUDGET_STOPPED, "detail": reason, "budget_state": budget_state,
                        "remaining": [t.task_id for t in corpus_tasks[completed_tasks:]]}
             runtime.ledger.append(
                 Event.create(

@@ -6,6 +6,8 @@ from typing import Any
 
 from .experiments import (
     VERIFIER_PASS,
+    call_consumption,
+    combine_usage,
     get_experiment,
 )
 
@@ -78,8 +80,11 @@ def arm_metrics(
     for c in arm_candidates:
         outcome_counts[str(c.get("outcome"))] = outcome_counts.get(str(c.get("outcome")), 0) + 1
     latencies = [float(c["latency_ms"]) for c in arm_calls if c.get("latency_ms") is not None]
-    tokens = sum(int(c.get("input_tokens", 0) or 0) + int(c.get("output_tokens", 0) or 0) for c in arm_calls)
-    cost = sum(float(c.get("cost_usd") or 0) for c in arm_calls)
+    usage = combine_usage([call_consumption(c) for c in arm_calls])
+    tokens = usage.known_tokens
+    cost = usage.known_cost_usd
+    # Historical cost_known semantics preserved verbatim (any known): changing
+    # it to all-known would silently alter frozen P-series report figures.
     cost_known = any(c.get("cost_usd") is not None for c in arm_calls)
     k = max((len(cs) for cs in by_task.values()), default=0)
     oracle = len(solved) / len(attempted) if attempted else 0.0
@@ -94,6 +99,7 @@ def arm_metrics(
         "successful_candidates": outcome_counts.get(VERIFIER_PASS, 0),
         "failures_by_category": outcome_counts,
         "tokens": tokens,
+        "tokens_complete": usage.tokens_complete,
         "cost_usd": round(cost, 6),
         "cost_known": cost_known,
         "cost_per_verified_solve": round(cost / len(solved), 6) if solved and cost_known else None,
