@@ -63,6 +63,35 @@ def sanitize_effective_params(params: Mapping[str, object]) -> dict[str, object]
     }
 
 
+class TransportOutcome(StrEnum):
+    """What the HTTP transport itself produced, before any interpretation."""
+
+    RESPONSE_RECEIVED = "response_received"
+    HTTP_ERROR = "http_error"
+    NO_RESPONSE = "no_response"
+
+
+@dataclass(frozen=True, slots=True)
+class TransportObservation:
+    """Ephemeral transport evidence carried from adapter to runtime.
+
+    Provider-neutral: exact response bytes (or the no-response fact), never
+    interpretations (no error_kind, usage, cost, completion). The runtime
+    persists the bytes to the content-addressed artifact store and the
+    metadata to an attempt.observed event; the bytes must never be serialized
+    into CallResult payloads, ledger events, or exports.
+    """
+
+    outcome: str = TransportOutcome.NO_RESPONSE.value
+    status_code: int | None = None
+    body: bytes | None = None
+    headers: Mapping[str, str] = field(default_factory=dict)
+    content_type: str | None = None
+    endpoint: str | None = None
+    exception_type: str | None = None
+    observed_at: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class CallResult:
     call_id: str
@@ -110,6 +139,11 @@ class CallResult:
     # Sanitized decoded provider payload preserved into the attempt's raw
     # artifact by the runtime. Must never contain credentials.
     raw_payload: Mapping[str, object] = field(default_factory=dict)
+    # Ephemeral transport evidence for the runtime only. Excluded from every
+    # ledger/export serialization: the artifact store carries the bytes, the
+    # ledger carries a reference. Never put response bytes here by value into
+    # a persisted payload.
+    transport: TransportObservation | None = None
 
 
 class CognitionAdapter(Protocol):

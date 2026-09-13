@@ -346,12 +346,17 @@ class Runtime:
 
         Crash-window contract (clean-restart durability only, no atomicity
         claims): the sequence per attempt is ``attempt.started`` -> provider
-        effect -> raw artifact stored -> ``attempt.completed`` appended, then
-        ``call.completed``. A crash between the provider effect and
-        ``attempt.completed`` leaves an ``attempt.started`` event with no
-        matching completion (ambiguous: provider may or may not have served
-        the request). A crash after the artifact store but before the ledger
-        append leaves an unreferenced content-addressed file (harmless orphan).
+        effect -> response-body blob stored -> ``attempt.observed`` appended
+        -> legacy mixed envelope stored -> ``attempt.completed`` appended,
+        then ``call.completed``. Ambiguity windows, from newest evidence
+        backwards:
+        - crash after ``attempt.observed`` but before ``attempt.completed``:
+          transport observation exists, interpretation completion absent;
+        - crash after body-blob storage but before ``attempt.observed``:
+          an unreferenced content-addressed response body may exist;
+        - crash between the provider effect and body storage: only
+          ``attempt.started`` exists and the observation is unknown
+          (the provider may or may not have served the request).
         ``call.manifest`` is appended before any attempt, so an interrupted
         call is always inspectable as UNRESOLVED. Exactly-once execution is
         NOT promised; retries create new attempts, never new tasks.
@@ -659,6 +664,17 @@ class Runtime:
             if result.effective_parameters
             else dict(manifest.effective_parameters)
         )
+        # Pure transport evidence first: body bytes (if any) -> blob, then the
+        # attempt.observed event. The legacy mixed envelope below is kept
+        # unchanged for compatibility; interpretation still flows from result.
+        self._store_transport_observation(
+            spec=spec,
+            result=result,
+            attempt_id=attempt_id,
+            attempt_index=attempt_index,
+            provider=provider,
+            causation_id=causation_id,
+        )
         raw_artifact = self._store_raw_observation(
             spec=spec,
             manifest=manifest,
@@ -774,6 +790,121 @@ class Runtime:
             artifact_type="raw_provider_observation",
         )
 
+    def _store_transport_observation(
+        self,
+        *,
+        spec: CallSpec,
+        result: CallResult,
+        attempt_id: str,
+        attempt_index: int,
+        provider: str | None,
+        causation_id: str | None,
+    ) -> None:
+        """Persist pure transport evidence for one attempt, if the adapter saw any.
+
+        Stores the exact response body bytes (when they exist) as a
+        content-addressed blob, then appends attempt.observed with transport
+        metadata and the blob reference. Adapters without transport evidence
+        (fakes, legacy dict fixtures) produce no event: absent observation
+        means unavailable under this schema, never an empty observation.
+        """
+        transport = result.transport
+        if transport is None or self.artifact_store is None:
+            if transport is None:
+                return
+            # No artifact store: observation cannot be preserved; record the
+            # metadata anyway so the transport outcome is not silently lost.
+            self._append_attempt_observed(
+                spec=spec,
+                result=result,
+                attempt_id=attempt_id,
+                attempt_index=attempt_index,
+                provider=provider,
+                body_ref=None,
+                byte_length=None,
+                causation_id=causation_id,
+            )
+            return
+        body_ref = None
+        byte_length = None
+        if transport.body is not None:
+            body_ref = self.artifact_store.store_bytes(
+                transport.body,
+                media_type=transport.content_type or "application/octet-stream",
+                artifact_type="provider_response_body",
+            )
+            record = self.ledger.read_artifact(body_ref.artifact_id)
+            byte_length = record.byte_length if record is not None else len(transport.body)
+        self._append_attempt_observed(
+            spec=spec,
+            result=result,
+            attempt_id=attempt_id,
+            attempt_index=attempt_index,
+            provider=provider,
+            body_ref=body_ref,
+            byte_length=byte_length,
+            causation_id=causation_id,
+        )
+
+    def _append_attempt_observed(
+        self,
+        *,
+        spec: CallSpec,
+        result: CallResult,
+        attempt_id: str,
+        attempt_index: int,
+        provider: str | None,
+        body_ref: ArtifactRef | None,
+        byte_length: int | None,
+        causation_id: str | None,
+    ) -> None:
+        transport = result.transport
+        assert transport is not None
+        event = Event.create(
+            stream_id=attempt_id,
+            kind="attempt.observed",
+            actor_id=spec.actor.actor_id,
+            payload={
+                "attempt_id": attempt_id,
+                "call_id": spec.call_id,
+                "task_id": spec.task_id,
+                "attempt_index": attempt_index,
+                "provider": provider,
+                "protocol": result.protocol,
+                "endpoint": transport.endpoint,
+                "transport_outcome": transport.outcome,
+                "http_status": transport.status_code,
+                "observed_at": transport.observed_at or now_utc(),
+                "response_body_artifact": None
+                if body_ref is None
+                else {
+                    "artifact_id": body_ref.artifact_id,
+                    "sha256": body_ref.sha256,
+                    "media_type": body_ref.media_type,
+                    "byte_length": byte_length,
+                },
+                "content_type": transport.content_type,
+                "headers": _allowlist_response_headers(transport.headers),
+                "exception_type": transport.exception_type,
+            },
+            causation_id=causation_id,
+            correlation_id=spec.task_id,
+        )
+        self.ledger.append(event)
+        return event.event_id
+
+    def get_attempt_observation(self, attempt_id: str) -> dict[str, Any] | None:
+        """Return the persisted transport metadata for one attempt, if any.
+
+        Returns the attempt.observed payload (transport metadata plus the
+        response-body artifact reference). Body bytes themselves are loaded
+        through the artifact store by artifact_id; they are not inlined here.
+        """
+        for event in self.ledger.events_by_kind(("attempt.observed",)):
+            if event.stream_id == attempt_id or str(event.payload.get("attempt_id")) == attempt_id:
+                return dict(event.payload)
+        return None
+
     def _interpret_attempt(
         self,
         spec: CallSpec,
@@ -817,7 +948,7 @@ class Runtime:
         totals: dict[str, float | int | None],
         causation_id: str | None,
     ) -> None:
-        payload = asdict(result)
+        payload = _call_result_event_payload(result)
         payload["idempotency_key"] = spec.idempotency_key
         payload["task_id"] = spec.task_id
         payload["directive_id"] = spec.directive_id
@@ -967,7 +1098,7 @@ class Runtime:
                         stream_id=call_id,
                         kind="call.completed",
                         actor_id=actor.actor_id,
-                        payload=asdict(result),
+                        payload=_call_result_event_payload(result),
                         correlation_id=task_id,
                     )
                 )
@@ -1186,7 +1317,7 @@ class Runtime:
     def _append_call_completed(
         self, result: CallResult, *, spec: CallSpec, causation_id: str | None
     ) -> None:
-        payload = asdict(result)
+        payload = _call_result_event_payload(result)
         payload["idempotency_key"] = spec.idempotency_key
         payload["task_id"] = spec.task_id
         payload["directive_id"] = spec.directive_id
@@ -1476,6 +1607,50 @@ class Runtime:
 
 
 # ---------------- recorded-cognition payload helpers ----------------
+
+
+def _call_result_event_payload(result: CallResult) -> dict[str, Any]:
+    """Serialize a CallResult for ledger/export payloads.
+
+    The ephemeral transport observation is excluded: response bytes travel
+    via the artifact store (plus an attempt.observed reference), never
+    inside JSON payloads. (Event.create would otherwise coerce bytes with
+    default=str into a silent "b'...'" corruption.)
+    """
+    payload = asdict(result)
+    payload.pop("transport", None)
+    return payload
+
+
+# Response headers approved for persistence (case-insensitive match).
+# Request IDs, retry guidance, rate-limit accounting, and provider routing
+# tokens cannot be reconstructed later; everything else is default-deny.
+# Never persisted: authorization, proxy-authorization, cookie, set-cookie,
+# x-api-key, or any header outside this list.
+_ALLOWED_RESPONSE_HEADERS = frozenset(
+    {
+        "request-id",
+        "x-request-id",
+        "retry-after",
+        "ratelimit-limit",
+        "ratelimit-remaining",
+        "ratelimit-reset",
+        "x-opencode-session",
+    }
+)
+_ALLOWED_RESPONSE_HEADER_PREFIXES = ("ratelimit-", "x-ratelimit-")
+
+
+def _allowlist_response_headers(headers: Mapping[str, Any]) -> dict[str, str]:
+    """Keep only explicitly approved response headers, keyed lower-cased."""
+    kept: dict[str, str] = {}
+    for key, value in headers.items():
+        lowered = str(key).lower()
+        if lowered in _ALLOWED_RESPONSE_HEADERS or lowered.startswith(
+            _ALLOWED_RESPONSE_HEADER_PREFIXES
+        ):
+            kept[lowered] = str(value)
+    return kept
 
 
 def _optional_int(value: object) -> int | None:

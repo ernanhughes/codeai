@@ -12,6 +12,8 @@ from .adapters import (
     NORMALIZER_VERSION,
     CallResult,
     CognitionAdapter,
+    TransportObservation,
+    TransportOutcome,
     is_credential_key,
     sanitize_effective_params,
 )
@@ -28,6 +30,18 @@ class ProviderHttpError(ProviderError):
     def __init__(self, status: int | None, message: str) -> None:
         super().__init__(message)
         self.status = status
+
+
+class TransportFailure(ProviderError):
+    """No HTTP response exists (timeout, DNS, connection reset, ...).
+
+    Distinct from an HTTP error response: there is no status, no headers,
+    and no body to preserve. The underlying exception type is retained.
+    """
+
+    def __init__(self, exception_type: str, message: str) -> None:
+        super().__init__(message)
+        self.exception_type = exception_type
 
 
 class MissingCredentialsError(ProviderError):
@@ -156,6 +170,99 @@ def _scrub_payload(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_scrub_payload(item) for item in value]
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class HttpResponse:
+    """Exact bytes of one HTTP response, before any JSON parsing.
+
+    Used by the OpenCode gateway path so the runtime can preserve provider
+    bodies verbatim. Never truncated, never decoded here.
+    """
+
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+    content_type: str | None = None
+
+
+def _content_type_of(headers: Mapping[str, str]) -> str | None:
+    for key, value in headers.items():
+        if str(key).lower() == "content-type":
+            return str(value).split(";")[0].strip() or None
+    return None
+
+
+def _request_bytes(
+    url: str,
+    payload: dict[str, Any],
+    headers: Mapping[str, str],
+    timeout: float,
+) -> HttpResponse:
+    """POST JSON and return the exact HTTP response (status, headers, bytes).
+
+    HTTP error statuses do NOT raise: an error body is evidence and is
+    returned intact. Only the absence of any HTTP response raises, as
+    TransportFailure carrying the underlying exception type.
+    """
+    import urllib.error
+
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=dict(headers), method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_headers = {str(k): str(v) for k, v in response.headers.items()}
+            return HttpResponse(
+                status=int(response.status),
+                headers=raw_headers,
+                body=response.read(),
+                content_type=_content_type_of(raw_headers),
+            )
+    except urllib.error.HTTPError as exc:
+        try:
+            raw_headers = (
+                {str(k): str(v) for k, v in exc.headers.items()} if exc.headers else {}
+            )
+        except (OSError, ValueError, AttributeError):
+            raw_headers = {}
+        try:
+            body = exc.read()
+        except (OSError, ValueError):
+            body = b""
+        return HttpResponse(
+            status=int(exc.code),
+            headers=raw_headers,
+            body=body,
+            content_type=_content_type_of(raw_headers),
+        )
+    except Exception as exc:  # network/timeout/transport failures: no response exists
+        raise TransportFailure(type(exc).__name__, f"provider request failed: {exc}") from exc
+
+
+def _parse_http_response(reply: HttpResponse) -> dict[str, Any]:
+    """Decode a preserved HTTP response, with the legacy error contract.
+
+    Success and error-message shapes are identical to _post_json_with_status
+    so existing classifications do not change; only the evidence path is new.
+    """
+    if reply.status != 200:
+        text = reply.body.decode("utf-8", errors="replace")
+        raise ProviderHttpError(reply.status, f"provider HTTP {reply.status}: {text[:500]}")
+    try:
+        text = reply.body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Legacy contract: undecodable 200 bodies surface as transport
+        # failures, not parse failures. Preserved verbatim.
+        raise ProviderHttpError(None, f"provider request failed: {exc}") from exc
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProviderHttpError(None, f"provider returned non-JSON response: {exc}") from exc
+    if isinstance(parsed, dict) and parsed.get("error"):
+        raise ProviderHttpError(None, f"provider error: {parsed['error']}")
+    if not isinstance(parsed, dict):
+        raise ProviderHttpError(None, "provider returned unexpected response shape")
+    return parsed
 
 
 def _params(spec: CallSpec, key: str, default: Any = None) -> Any:
@@ -590,7 +697,9 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
     base_url: str = OPENCODE_ZEN_BASE_URL
     protocol: str = "responses"
     timeout: float = 120.0
-    http_post: Callable[..., dict[str, Any]] | None = None
+    # Test seam: may return a parsed dict (legacy fixture shape, no transport
+    # evidence) or an HttpResponse (exact bytes preserved as evidence).
+    http_post: Callable[..., dict[str, Any] | HttpResponse] | None = None
     user_agent: str = "codeai/0.1.0"
     # Go-gateway routing token sent as x-opencode-session. Explicit when set;
     # otherwise generated per invoke and recorded on the attempt (transport
@@ -689,14 +798,15 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
     def invoke(self, spec: CallSpec) -> CallResult:
         started = time.perf_counter()
         started_at = _now_iso()
+        transport: TransportObservation | None = None
         try:
             key = self._require_key()
             if not self.base_url:
                 raise ProviderError("OpenCode base_url is required")
             body = self._request_body(spec)
-            post = self.http_post or _post_json_with_status
             session_id = self._resolve_session()
-            parsed = post(
+            post = self.http_post or _request_bytes
+            reply = post(
                 f"{self.base_url.rstrip('/')}{self._endpoint()}",
                 body,
                 {
@@ -707,6 +817,24 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 },
                 self.timeout,
             )
+            if isinstance(reply, HttpResponse):
+                transport = TransportObservation(
+                    outcome=(
+                        TransportOutcome.RESPONSE_RECEIVED.value
+                        if reply.status == 200
+                        else TransportOutcome.HTTP_ERROR.value
+                    ),
+                    status_code=reply.status,
+                    body=reply.body,
+                    headers=dict(reply.headers),
+                    content_type=reply.content_type,
+                    endpoint=self._endpoint(),
+                    observed_at=_now_iso(),
+                )
+                parsed = _parse_http_response(reply)
+            else:
+                # Legacy fixture shape: parsed JSON only, no transport bytes.
+                parsed = reply
             if self.protocol == "chat_completions":
                 text = _chat_text(parsed)
                 raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
@@ -744,8 +872,20 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 protocol=self.protocol,
                 raw_observation_kind="decoded_json",
                 raw_payload=_scrub_payload(parsed),
+                transport=transport,
             )
         except ProviderError as exc:
+            if transport is None and isinstance(exc, TransportFailure):
+                transport = TransportObservation(
+                    outcome=TransportOutcome.NO_RESPONSE.value,
+                    status_code=None,
+                    body=None,
+                    headers={},
+                    content_type=None,
+                    endpoint=self._endpoint(),
+                    exception_type=exc.exception_type,
+                    observed_at=_now_iso(),
+                )
             return CallResult(
                 call_id=spec.call_id,
                 raw_output="",
@@ -759,6 +899,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 effective_parameters=self.effective_request(spec),
                 protocol=self.protocol,
                 raw_observation_kind="decoded_json",
+                transport=transport,
                 status="failed",
                 error=str(exc),
                 provider=self.GATEWAY,
