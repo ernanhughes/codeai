@@ -144,6 +144,10 @@ class CallResult:
     # ledger carries a reference. Never put response bytes here by value into
     # a persisted payload.
     transport: TransportObservation | None = None
+    # Replay marker: True when this result reuses a prior completed effect
+    # without a new provider invocation. Operational provenance only, never
+    # persisted into call.completed (history is not rewritten).
+    replayed: bool = False
 
 
 class CognitionAdapter(Protocol):

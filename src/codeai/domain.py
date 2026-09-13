@@ -387,6 +387,10 @@ class RecordedCall:
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
     total_cost_usd: float | None = None
+    # Replay marker: True when this object re-presents a prior completed
+    # call resolved by idempotency key (no new provider effect). Reconstructions
+    # via get_recorded_call always carry False: they are the original.
+    replayed: bool = False
 
 
 class GenerationState(StrEnum):

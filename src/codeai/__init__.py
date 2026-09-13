@@ -113,7 +113,12 @@ from .providers import (
     ProviderHttpError,
     TransportFailure,
 )
-from .runtime import PreconditionMismatch, Runtime, default_repository_state_hash
+from .runtime import (
+    IdempotencyConflictError,
+    PreconditionMismatch,
+    Runtime,
+    default_repository_state_hash,
+)
 from .scheduler import Operation, SchedulerDecision, SchedulerInput, decide_next_step
 from .stances import (
     ASSUMPTION_CHALLENGE,
@@ -196,6 +201,7 @@ __all__ = [
     "FileArtifactStore",
     "GenerationState",
     "HttpResponse",
+    "IdempotencyConflictError",
     "InterpretationInput",
     "InvalidControlError",
     "LocalCommandVerifier",

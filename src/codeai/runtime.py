@@ -71,6 +71,15 @@ class PreconditionMismatch(RuntimeError):
     pass
 
 
+class IdempotencyConflictError(ValueError):
+    """Same idempotency key, materially different logical request.
+
+    Raised before any provider effect when a replay lookup finds a completed
+    recorded call whose request fingerprint does not match the incoming spec.
+    Names the mismatching dimension, never secret values.
+    """
+
+
 def now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -374,6 +383,14 @@ class Runtime:
         call is always inspectable as UNRESOLVED. Exactly-once execution is
         NOT promised; retries create new attempts, never new tasks.
 
+        Replay: when the idempotency key matches a completed recorded call
+        with the same request fingerprint, no provider effect occurs. Only
+        ``call.requested`` and ``call.replayed`` are appended and the
+        original RecordedCall is returned marked replayed. A key whose
+        fingerprint differs raises IdempotencyConflictError before any
+        effect. Keys matching only legacy (non-recorded) completions, or no
+        terminal completion at all, execute fresh.
+
         Cognition completion (!= task completion): a "succeeded" recorded
         call only means the cognition operation produced an output. It says
         nothing about correctness, support, authorization, or verification.
@@ -383,15 +400,29 @@ class Runtime:
         any single attempt is retried is decided by the versioned attempt
         policy from that attempt's interpretation, never by heuristics here.
         """
+        recorded, _, _ = self._invoke_recorded_call_detailed(
+            spec,
+            adapter=adapter,
+            max_attempts=max_attempts,
+            interpreter_version=interpreter_version,
+            policy_version=policy_version,
+            model_config=model_config,
+        )
+        return recorded
+
+    def _invoke_recorded_call_detailed(
+        self,
+        spec: CallSpec,
+        *,
+        adapter: CognitionAdapter,
+        max_attempts: int = 1,
+        interpreter_version: str = INTERPRETER_V2,
+        policy_version: str = ATTEMPT_POLICY_V2,
+        model_config: Any | None = None,
+    ) -> tuple[RecordedCall, CallResult, bool]:
+        """Recorded invocation returning (recorded call, final result, replayed)."""
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
-        # Prepare once: adapters exposing prepare()/send() produce a single
-        # prepared request that is both recorded (manifest) and sent (every
-        # attempt). Unknown/invalid controls raise here, before any event or
-        # provider effect. Adapters without this capability use the legacy
-        # invoke path unchanged.
-        prepare = getattr(adapter, "prepare", None)
-        prepared = prepare(spec) if callable(prepare) else None
         request_event = Event.create(
             stream_id=spec.call_id,
             kind="call.requested",
@@ -401,6 +432,47 @@ class Runtime:
         )
         self.ledger.append(request_event)
 
+        replayed_completion = self._find_recorded_completion(spec.idempotency_key)
+        if replayed_completion is not None:
+            original_call_id, completed_payload = replayed_completion
+            original = self.get_recorded_call(original_call_id)
+            assert original is not None
+            self._check_replay_fingerprint(spec, original)
+            self.ledger.append(
+                Event.create(
+                    stream_id=spec.call_id,
+                    kind="call.replayed",
+                    actor_id=spec.actor.actor_id,
+                    payload={
+                        "requested_call_id": spec.call_id,
+                        "task_id": spec.task_id,
+                        "idempotency_key": spec.idempotency_key,
+                        "original_call_id": original_call_id,
+                        "original_attempt_ids": [
+                            attempt.attempt_id for attempt in original.attempts
+                        ],
+                        "replayed_at": now_utc(),
+                        "replay_reason": "idempotency-key hit on completed recorded call",
+                        "original_call_status": original.status,
+                    },
+                    causation_id=request_event.event_id,
+                    correlation_id=spec.task_id,
+                )
+            )
+            result = replace(
+                self._call_result_from_payload(completed_payload),
+                call_id=original_call_id,
+                replayed=True,
+            )
+            return replace(original, replayed=True), result, True
+
+        # Prepare once: adapters exposing prepare()/send() produce a single
+        # prepared request that is both recorded (manifest) and sent (every
+        # attempt). Unknown/invalid controls raise here, before any event or
+        # provider effect. Adapters without this capability use the legacy
+        # invoke path unchanged.
+        prepare = getattr(adapter, "prepare", None)
+        prepared = prepare(spec) if callable(prepare) else None
         if prepared is not None:
             manifest = self._build_manifest_from_prepared(spec, prepared)
         else:
@@ -519,7 +591,7 @@ class Runtime:
             ),
             decision_policy_version=policy_version,
         )
-        return RecordedCall(
+        recorded = RecordedCall(
             call_id=spec.call_id,
             task_id=spec.task_id,
             chamber=manifest.chamber,
@@ -530,9 +602,14 @@ class Runtime:
             total_output_tokens=totals["output_tokens"],
             total_cost_usd=totals["cost_usd"],
         )
+        return recorded, last_result, False
 
     def get_recorded_call(self, call_id: str) -> RecordedCall | None:
-        """Reconstruct a logical call (manifest + attempts + status) from the ledger."""
+        """Reconstruct a logical call (manifest + attempts + status) from the ledger.
+
+        Falls back through call.replayed: a requested call id that only ever
+        replayed resolves to its original recorded call.
+        """
         manifest_event = next(
             (
                 event
@@ -547,10 +624,9 @@ class Runtime:
             for event in self.ledger.events_by_kind(("attempt.completed",))
             if str(event.payload.get("call_id", "")) == call_id
         ]
-        if manifest_event is None and not attempt_events:
-            return None
         if manifest_event is None:
-            return None
+            # No manifest: either unknown, or a requested id that only replayed.
+            return self._resolve_replay(call_id)
         manifest = _manifest_from_payload(manifest_event.payload)
         attempts = tuple(
             sorted(
@@ -592,6 +668,59 @@ class Runtime:
     def list_call_attempts(self, call_id: str) -> tuple[AttemptRecord, ...]:
         recorded = self.get_recorded_call(call_id)
         return () if recorded is None else recorded.attempts
+
+    def _resolve_replay(self, requested_call_id: str) -> RecordedCall | None:
+        """Resolve a requested call id that only ever replayed to its original."""
+        for event in self.ledger.events_by_kind(("call.replayed",)):
+            if str(event.payload.get("requested_call_id", "")) == requested_call_id:
+                original_call_id = str(event.payload.get("original_call_id", ""))
+                if original_call_id and original_call_id != requested_call_id:
+                    return self.get_recorded_call(original_call_id)
+                return None
+        return None
+
+    def _find_recorded_completion(
+        self, idempotency_key: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Locate a completed RECORDED call by idempotency key, ledger order.
+
+        Only call.completed events with a matching call.manifest qualify:
+        legacy (non-recorded) completions and keys without terminal evidence
+        are misses, so replay never crosses execution contracts and never
+        fabricates completion for crashed/incomplete calls.
+        """
+        manifests = {
+            str(event.payload.get("call_id", event.stream_id))
+            for event in self.ledger.events_by_kind(("call.manifest",))
+        }
+        for event in self.ledger.events_by_kind(("call.completed",)):
+            if event.payload.get("idempotency_key") != idempotency_key:
+                continue
+            call_id = str(event.payload.get("call_id", event.stream_id))
+            if call_id in manifests:
+                return call_id, dict(event.payload)
+        return None
+
+    def _check_replay_fingerprint(self, spec: CallSpec, original: RecordedCall) -> None:
+        """Reject same-key, materially-different requests before any effect."""
+        expected = (
+            original.task_id,
+            original.manifest.prompt_hash,
+            original.manifest.chamber,
+            original.manifest.requested_model,
+        )
+        actual = _request_fingerprint(spec)
+        if actual != expected:
+            dimensions = ("task_id", "prompt_hash", "chamber", "requested_model")
+            mismatched = sorted(
+                dimension
+                for dimension, want, got in zip(dimensions, expected, actual)
+                if want != got
+            )
+            raise IdempotencyConflictError(
+                f"idempotency key {spec.idempotency_key!r} matches completed call "
+                f"{original.call_id!r} but the request differs in: {', '.join(mismatched)}"
+            )
 
     # ---------------- recorded-call internals ----------------
 
@@ -1602,9 +1731,14 @@ class Runtime:
     # ---------------- call persistence helpers ----------------
 
     @staticmethod
+    @staticmethod
     def _call_spec_payload(spec: CallSpec) -> dict[str, object]:
         payload = asdict(spec)
         payload["idempotency_key"] = spec.idempotency_key
+        # Never persist credential-like caller parameters: the requested map
+        # is provenance of intent, not a transport channel. Declared controls
+        # survive; unknown values may still be rejected pre-effect by prepare.
+        payload["parameters"] = sanitize_effective_params(dict(spec.parameters))
         return payload
 
     def _find_call_result(self, idempotency_key: str) -> CallResult | None:
@@ -1706,6 +1840,7 @@ class Runtime:
             protocol=self._payload_value(payload, "protocol"),
             raw_observation_kind=self._payload_value(payload, "raw_observation_kind"),
             raw_payload=dict(raw_payload) if isinstance(raw_payload, dict) else {},
+            replayed=bool(payload.get("replayed", False)),
         )
 
     def _append_context_compiled(
@@ -1936,6 +2071,25 @@ class Runtime:
 
 
 # ---------------- recorded-cognition payload helpers ----------------
+
+
+def _prompt_hash_for_spec(spec: CallSpec) -> str:
+    """Stable prompt identity shared by manifest construction and replay checks."""
+    return hashlib.sha256(f"{spec.instruction}\0{spec.context.prompt}".encode()).hexdigest()
+
+
+def _request_fingerprint(spec: CallSpec) -> tuple[Any, ...]:
+    """Logical request identity for idempotency matching: task, prompt bytes,
+    chamber, and requested logical model. Resolved occupants are deliberately
+    excluded: re-resolution under the same key replays the original effect."""
+    chamber = spec.chamber
+    logical = spec.logical_model or chamber
+    return (
+        spec.task_id,
+        _prompt_hash_for_spec(spec),
+        chamber,
+        logical or spec.actor.model,
+    )
 
 
 def _interpretation_input(
