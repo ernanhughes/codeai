@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     call.add_argument("--model", default="fake-model")
     call.add_argument("--response", default=None)
     call.add_argument("--experiment", default=None)
+    call.add_argument("--chamber", default=None, help="logical job name (e.g. deep-review)")
+    call.add_argument("--logical-model", default=None, help="logical model key for resolution")
+    call.add_argument("--max-attempts", type=int, default=1)
+
+    calls_cmd = sub.add_parser("calls", help="inspect recorded cognition calls")
+    calls_sub = calls_cmd.add_subparsers(dest="calls_command", required=True)
+    calls_show = calls_sub.add_parser("show", help="show one recorded call with attempts")
+    calls_show.add_argument("call_id")
 
     fanout = sub.add_parser("fanout", help="sealed blind fanout of N independent calls")
     fanout.add_argument("--task", required=True)
@@ -127,6 +135,24 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--title", default="codeai")
     oc.add_argument("--username", default=os.getenv("OPENCODE_SERVER_USERNAME", "opencode"))
     oc.add_argument("--password", default=os.getenv("OPENCODE_SERVER_PASSWORD"))
+    quality = sub.add_parser("quality", help="deterministic quality measurements (observational)")
+    quality_sub = quality.add_subparsers(dest="quality_command", required=True)
+
+    quality_measure = quality_sub.add_parser("measure", help="measure one directory snapshot")
+    quality_measure.add_argument("target")
+    quality_measure.add_argument("--json", action="store_true", dest="as_json")
+
+    quality_compare = quality_sub.add_parser("compare", help="compare two directory snapshots")
+    quality_compare.add_argument("base")
+    quality_compare.add_argument("current")
+    quality_compare.add_argument("--json", action="store_true", dest="as_json")
+
+    quality_trajectory = quality_sub.add_parser(
+        "trajectory", help="measure recent git history and show trends (read-only)"
+    )
+    quality_trajectory.add_argument("target")
+    quality_trajectory.add_argument("--commits", type=int, default=10)
+    quality_trajectory.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -192,6 +218,9 @@ def main(argv: list[str] | None = None) -> int:
             responses=[args.response] if args.response else None,
             provider=args.provider,
             model=args.model,
+            # The CLI fake observes no provider revision; stay UNKNOWN rather
+            # than promoting the fake's stand-in version to observed metadata.
+            model_version=None,
         )
         spec = CallSpec(
             call_id=str(uuid.uuid4()),
@@ -206,14 +235,53 @@ def main(argv: list[str] | None = None) -> int:
             variant=Variant(
                 model=args.model, provider=args.provider, experiment=args.experiment
             ),
+            chamber=args.chamber,
+            logical_model=args.logical_model,
         )
-        result = runtime.invoke_call(spec, adapter=adapter)
-        print(f"call_id: {result.call_id}")
-        print(f"status: {result.status}")
-        print(f"model: {result.model}")
-        print(f"cost_usd: {result.cost_usd}")
-        print(f"raw_output: {result.raw_output[:500]}")
-        return 0 if result.status == "succeeded" else 1
+        recorded = runtime.invoke_recorded_call(
+            spec, adapter=adapter, max_attempts=args.max_attempts
+        )
+        result = recorded.attempts[-1] if recorded.attempts else None
+        print(f"task_id: {recorded.task_id}")
+        print(f"call_id: {recorded.call_id}")
+        print(f"chamber: {recorded.chamber}")
+        print(f"requested_model: {recorded.manifest.requested_model}")
+        print(f"provider: {recorded.manifest.provider}")
+        print(f"resolved_model: {recorded.manifest.resolved_model_id}")
+        revision = recorded.attempts[-1].provider_revision if recorded.attempts else None
+        print(f"provider_revision: {revision or 'UNKNOWN'}")
+        print(f"pricing_version: {recorded.manifest.pricing_version}")
+        print(f"attempt_count: {len(recorded.attempts)}")
+        for attempt in recorded.attempts:
+            print(f"attempt {attempt.attempt_index}: id={attempt.attempt_id} status={attempt.status}")
+            print(f"  raw_artifact: {attempt.raw_artifact.sha256 if attempt.raw_artifact else None}")
+            print(f"  usage_source: {attempt.usage.source.value} cost={attempt.cost_usd}")
+            print(f"  effective_parameters: {dict(attempt.effective_parameters)}")
+        print(f"call_status: {recorded.status}")
+        print("task_status: not automatically completed")
+        return 0 if recorded.status == "succeeded" else 1
+
+    if args.command == "calls" and args.calls_command == "show":
+        recorded = runtime.get_recorded_call(args.call_id)
+        if recorded is None:
+            print(f"call not found: {args.call_id}", file=sys.stderr)
+            return 1
+        print(f"task_id: {recorded.task_id}")
+        print(f"call_id: {recorded.call_id}")
+        print(f"chamber: {recorded.chamber}")
+        print(f"requested_model: {recorded.manifest.requested_model}")
+        print(f"provider: {recorded.manifest.provider}")
+        print(f"resolved_model: {recorded.manifest.resolved_model_id}")
+        print(f"pricing_version: {recorded.manifest.pricing_version}")
+        print(f"attempt_count: {len(recorded.attempts)}")
+        for attempt in recorded.attempts:
+            print(f"attempt {attempt.attempt_index}: id={attempt.attempt_id} status={attempt.status}")
+            print(f"  provider_request_id: {attempt.provider_request_id}")
+            print(f"  raw_artifact: {attempt.raw_artifact.sha256 if attempt.raw_artifact else None}")
+            print(f"  usage_source: {attempt.usage.source.value} cost={attempt.cost_usd}")
+            print(f"  effective_parameters: {dict(attempt.effective_parameters)}")
+        print(f"call_status: {recorded.status}")
+        return 0
 
     if args.command == "fanout":
         from .adapters import FakeCognitionAdapter
@@ -323,6 +391,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "experiment":
         return _experiment_command(runtime, args)
 
+    if args.command == "quality":
+        return _quality_command(args)
+
     if args.command == "opencode":
         task = ensure_task(runtime, args.instruction, args.task)
         client_kwargs = {"username": args.username}
@@ -353,6 +424,98 @@ def main(argv: list[str] | None = None) -> int:
             print(result.error, file=sys.stderr)
         print(f"\n[opencode-session: {result.state_hash}]")
         return 0 if result.status == "succeeded" else 1
+    return 2
+
+
+def _quality_command(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from .quality import (
+        compare_snapshots,
+        generate_investigations,
+        list_history_commits,
+        measure_commit,
+        render_quality_report,
+        render_trajectory_table,
+        snapshot_directory,
+        snapshot_payload,
+    )
+
+    if args.quality_command == "measure":
+        snapshot = snapshot_directory(Path(args.target))
+        if args.as_json:
+            print(_json.dumps(snapshot_payload(snapshot), indent=2, sort_keys=True))
+        else:
+            print(render_quality_report(snapshot), end="")
+        return 0
+
+    if args.quality_command == "compare":
+        base = snapshot_directory(Path(args.base))
+        current = snapshot_directory(Path(args.current))
+        trajectory = compare_snapshots(base, current)
+        investigations = generate_investigations(trajectory, current=current)
+        if args.as_json:
+            print(
+                _json.dumps(
+                    {
+                        "base": snapshot_payload(base),
+                        "current": snapshot_payload(current),
+                        "deltas": [
+                            {
+                                "metric": d.metric,
+                                "previous": d.previous,
+                                "current": d.current,
+                                "delta": d.delta,
+                                "trend": d.trend.value,
+                            }
+                            for d in trajectory.deltas
+                        ],
+                        "investigations": [i.question for i in investigations],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(render_quality_report(current, trajectory, investigations), end="")
+        return 0
+
+    if args.quality_command == "trajectory":
+        root = Path(args.target)
+        commits = list_history_commits(root, limit=args.commits)
+        if not commits:
+            print(f"no git history found under {root}", file=sys.stderr)
+            return 1
+        history = [measure_commit(root, sha) for sha in commits]
+        trajectories = [
+            compare_snapshots(history[i], history[i + 1]) for i in range(len(history) - 1)
+        ]
+        if args.as_json:
+            print(
+                _json.dumps(
+                    {
+                        "snapshots": [snapshot_payload(s) for s in history],
+                        "trajectories": [
+                            [
+                                {
+                                    "metric": d.metric,
+                                    "previous": d.previous,
+                                    "current": d.current,
+                                    "delta": d.delta,
+                                    "trend": d.trend.value,
+                                }
+                                for d in t.deltas
+                            ]
+                            for t in trajectories
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(render_trajectory_table(history, trajectories), end="")
+        return 0
     return 2
 
 

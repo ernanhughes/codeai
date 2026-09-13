@@ -6,16 +6,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .providers import AnthropicAdapter, OpenAIAdapter, OpenAICompatibleAdapter
+from .providers import (
+    OPENCODE_ZEN_API_KEY_ENV,
+    OPENCODE_ZEN_BASE_URL,
+    AnthropicAdapter,
+    OpenAIAdapter,
+    OpenAICompatibleAdapter,
+    OpenCodeCognitionAdapter,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ModelMapping:
     logical_name: str
-    adapter: str  # "openai" | "anthropic" | "openai-compatible" | "fake"
+    adapter: str  # "openai" | "anthropic" | "openai-compatible" | "opencode" | "fake"
     model: str
     base_url: str | None = None
     provider: str | None = None
+    # Wire dialect for gateways that support several, e.g. OpenCode Zen:
+    # "responses" | "chat_completions" | "messages". None = adapter default.
+    protocol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +38,15 @@ class ModelConfig:
                 f"unknown model '{logical_name}'; configured: {sorted(self.models) or 'none'}"
             )
         return self.models[logical_name]
+
+    def resolve_chamber(self, chamber: str) -> ModelMapping:
+        """Resolve a chamber (logical job name) to its concrete occupant.
+
+        A chamber is named by its job (e.g. "deep-review"), not by its model.
+        This reuses the single logical-model mapping; there is no second
+        registry. Raises KeyError for unconfigured chambers.
+        """
+        return self.resolve(chamber)
 
     def build_adapter(self, logical_name: str) -> Any:
         """Build a CognitionAdapter for a logical model name. Secrets from env only."""
@@ -47,6 +66,12 @@ class ModelConfig:
                 model=mapping.model,
                 base_url=mapping.base_url or "http://localhost:11434/v1",
                 provider_name=mapping.provider or "openai-compatible",
+            )
+        if mapping.adapter == "opencode":
+            return OpenCodeCognitionAdapter(
+                model=mapping.model,
+                base_url=mapping.base_url or OPENCODE_ZEN_BASE_URL,
+                protocol=mapping.protocol or "responses",
             )
         if mapping.adapter == "fake":
             from .adapters import FakeCognitionAdapter
@@ -79,13 +104,19 @@ def load_model_config(path: str | Path | None = None) -> ModelConfig:
             model=str(entry.get("model", logical_name)),
             base_url=entry.get("base_url"),
             provider=entry.get("provider"),
+            protocol=entry.get("protocol"),
         )
     return ModelConfig(models=models)
 
 
 EXAMPLE_CONFIG = """\
 # Logical model names for experiments. No secrets here: keys come from env.
-# OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENAI_COMPAT_API_KEY
+# OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENAI_COMPAT_API_KEY, OPENCODE_ZEN_API_KEY
+[models.deep-review]
+adapter = "opencode"
+model = "mimo-v2.5"
+protocol = "responses"
+
 [models.qwen]
 adapter = "openai-compatible"
 base_url = "http://localhost:11434/v1"
@@ -107,4 +138,6 @@ def missing_credentials(mapping: ModelMapping) -> str | None:
         return "set OPENAI_API_KEY"
     if mapping.adapter == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         return "set ANTHROPIC_API_KEY"
+    if mapping.adapter == "opencode" and not os.getenv(OPENCODE_ZEN_API_KEY_ENV):
+        return f"set {OPENCODE_ZEN_API_KEY_ENV}"
     return None

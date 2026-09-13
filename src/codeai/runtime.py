@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
-from collections.abc import Callable
-from dataclasses import asdict, replace
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from .adapters import (
+    NORMALIZER_VERSION,
+    RAW_OBSERVATION_KIND,
     ActionRequest,
     ActionResult,
     ActionStatus,
@@ -19,30 +25,48 @@ from .adapters import (
     CognitionAdapter,
     ExecutionAdapter,
     VerificationAdapter,
+    sanitize_effective_params,
 )
 from .artifacts import FileArtifactStore
 from .context import CompilationTrace, ContextCompiler
 from .domain import (
     ActorRef,
     ArtifactRef,
+    AttemptRecord,
+    AttemptStatus,
     Authority,
+    CallManifest,
     Capability,
     Claim,
     ClaimRelationship,
     ClaimStatus,
     ContextPackage,
+    CostSource,
     Directive,
     EvidenceClass,
+    LogicalCallStatus,
+    RecordedCall,
     Seal,
     Task,
+    Usage,
+    UsageSource,
     Variant,
 )
 from .ledger import Event, SQLiteLedger
 from .policy import AuthorityDenied, PolicyEngine
+from .providers import PRICING_VERSION, estimate_cost_usd
 
 
 class PreconditionMismatch(RuntimeError):
     pass
+
+
+# Attempt classifications that may be retried inside one logical call when the
+# caller explicitly opts into more than one attempt (max_attempts > 1).
+# This is a representability seam, not an autonomous retry policy: the default
+# is max_attempts=1 (no retry), and no backoff, swapping, or scoring happens
+# here.
+RETRYABLE_ERROR_KINDS = ("transient_failure", "empty_output", "rate_limited")
 
 
 def now_utc() -> str:
@@ -304,6 +328,528 @@ class Runtime:
             )
         self._append_call_completed(finalized, spec=spec, causation_id=request_event.event_id)
         return finalized
+
+    # ------------------------------------------------------------------
+    # Recorded cognition: Task -> Logical Call -> Attempt(s) -> Observation
+    # ------------------------------------------------------------------
+
+    def invoke_recorded_call(
+        self,
+        spec: CallSpec,
+        *,
+        adapter: CognitionAdapter,
+        max_attempts: int = 1,
+        retry_on: tuple[str, ...] = RETRYABLE_ERROR_KINDS,
+        model_config: Any | None = None,
+    ) -> RecordedCall:
+        """Execute one logical cognition call with explicit attempt accounting.
+
+        Crash-window contract (clean-restart durability only, no atomicity
+        claims): the sequence per attempt is ``attempt.started`` -> provider
+        effect -> raw artifact stored -> ``attempt.completed`` appended, then
+        ``call.completed``. A crash between the provider effect and
+        ``attempt.completed`` leaves an ``attempt.started`` event with no
+        matching completion (ambiguous: provider may or may not have served
+        the request). A crash after the artifact store but before the ledger
+        append leaves an unreferenced content-addressed file (harmless orphan).
+        ``call.manifest`` is appended before any attempt, so an interrupted
+        call is always inspectable as UNRESOLVED. Exactly-once execution is
+        NOT promised; retries create new attempts, never new tasks.
+
+        Cognition completion (!= task completion): a "succeeded" recorded
+        call only means the cognition operation produced an output. It says
+        nothing about correctness, support, authorization, or verification.
+
+        No automatic retry policy lives here: ``max_attempts`` defaults to 1.
+        Passing ``max_attempts > 1`` explicitly opts into bounded re-attempts
+        for classifications in ``retry_on`` within this single logical call.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        request_event = Event.create(
+            stream_id=spec.call_id,
+            kind="call.requested",
+            actor_id=spec.actor.actor_id,
+            payload=self._call_spec_payload(spec),
+            correlation_id=spec.task_id,
+        )
+        self.ledger.append(request_event)
+
+        manifest = self._build_manifest(spec, adapter=adapter, model_config=model_config)
+        self.ledger.append(
+            Event.create(
+                stream_id=spec.call_id,
+                kind="call.manifest",
+                actor_id=spec.actor.actor_id,
+                payload=_manifest_payload(manifest),
+                causation_id=request_event.event_id,
+                correlation_id=spec.task_id,
+            )
+        )
+
+        attempts: list[AttemptRecord] = []
+        last_result: CallResult | None = None
+        for attempt_index in range(1, max_attempts + 1):
+            attempt_id = str(uuid.uuid4())
+            started_at = now_utc()
+            self.ledger.append(
+                Event.create(
+                    stream_id=attempt_id,
+                    kind="attempt.started",
+                    actor_id=spec.actor.actor_id,
+                    payload={
+                        "attempt_id": attempt_id,
+                        "call_id": spec.call_id,
+                        "task_id": spec.task_id,
+                        "attempt_index": attempt_index,
+                        "started_at": started_at,
+                        "provider": manifest.provider,
+                        "resolved_model_id": manifest.resolved_model_id,
+                    },
+                    causation_id=request_event.event_id,
+                    correlation_id=spec.task_id,
+                )
+            )
+            try:
+                observed = adapter.invoke(spec)
+            except RuntimeError as exc:
+                observed = CallResult(
+                    call_id=spec.call_id,
+                    raw_output="",
+                    input_tokens=None,
+                    output_tokens=None,
+                    usage_source=UsageSource.UNAVAILABLE.value,
+                    error_kind="adapter_exception",
+                    pricing_version=PRICING_VERSION,
+                    cost_source=CostSource.UNKNOWN.value,
+                    normalizer_version=NORMALIZER_VERSION,
+                    status="failed",
+                    error=str(exc),
+                    provider=manifest.provider,
+                    model=manifest.resolved_model_id,
+                    started_at=started_at,
+                    completed_at=now_utc(),
+                )
+            finished_at = now_utc()
+            attempt = self._record_attempt(
+                spec,
+                manifest=manifest,
+                result=observed,
+                attempt_id=attempt_id,
+                attempt_index=attempt_index,
+                started_at=started_at,
+                finished_at=finished_at,
+                causation_id=request_event.event_id,
+            )
+            attempts.append(attempt)
+            last_result = self._interpret_attempt(spec, manifest=manifest, attempt=attempt, result=observed)
+            if attempt.status == AttemptStatus.SUCCEEDED.value:
+                break
+            if attempt_index < max_attempts and (attempt.error_kind in retry_on):
+                continue
+            break
+
+        assert last_result is not None
+        call_status = (
+            LogicalCallStatus.SUCCEEDED.value
+            if attempts and attempts[-1].status == AttemptStatus.SUCCEEDED.value
+            else LogicalCallStatus.FAILED.value
+        )
+        totals = _aggregate_totals(attempts)
+        self._append_recorded_call_completed(
+            last_result,
+            spec=spec,
+            manifest=manifest,
+            attempts=attempts,
+            call_status=call_status,
+            totals=totals,
+            causation_id=request_event.event_id,
+        )
+        return RecordedCall(
+            call_id=spec.call_id,
+            task_id=spec.task_id,
+            chamber=manifest.chamber,
+            manifest=manifest,
+            attempts=tuple(attempts),
+            status=call_status,
+            total_input_tokens=totals["input_tokens"],
+            total_output_tokens=totals["output_tokens"],
+            total_cost_usd=totals["cost_usd"],
+        )
+
+    def get_recorded_call(self, call_id: str) -> RecordedCall | None:
+        """Reconstruct a logical call (manifest + attempts + status) from the ledger."""
+        manifest_event = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("call.manifest",))
+                if event.stream_id == call_id
+                or str(event.payload.get("call_id", "")) == call_id
+            ),
+            None,
+        )
+        attempt_events = [
+            event
+            for event in self.ledger.events_by_kind(("attempt.completed",))
+            if str(event.payload.get("call_id", "")) == call_id
+        ]
+        if manifest_event is None and not attempt_events:
+            return None
+        if manifest_event is None:
+            return None
+        manifest = _manifest_from_payload(manifest_event.payload)
+        attempts = tuple(
+            sorted(
+                (_attempt_from_payload(event.payload) for event in attempt_events),
+                key=lambda attempt: attempt.attempt_index,
+            )
+        )
+        completed = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("call.completed",))
+                if str(event.payload.get("call_id", "")) == call_id
+            ),
+            None,
+        )
+        if completed is not None and completed.payload.get("call_status"):
+            status = str(completed.payload["call_status"])
+        elif attempts:
+            status = (
+                LogicalCallStatus.SUCCEEDED.value
+                if attempts[-1].status == AttemptStatus.SUCCEEDED.value
+                else LogicalCallStatus.FAILED.value
+            )
+        else:
+            status = LogicalCallStatus.UNRESOLVED.value
+        totals = _aggregate_totals(list(attempts))
+        return RecordedCall(
+            call_id=call_id,
+            task_id=manifest.task_id,
+            chamber=manifest.chamber,
+            manifest=manifest,
+            attempts=attempts,
+            status=status,
+            total_input_tokens=totals["input_tokens"],
+            total_output_tokens=totals["output_tokens"],
+            total_cost_usd=totals["cost_usd"],
+        )
+
+    def list_call_attempts(self, call_id: str) -> tuple[AttemptRecord, ...]:
+        recorded = self.get_recorded_call(call_id)
+        return () if recorded is None else recorded.attempts
+
+    # ---------------- recorded-call internals ----------------
+
+    def _build_manifest(
+        self,
+        spec: CallSpec,
+        *,
+        adapter: CognitionAdapter,
+        model_config: Any | None = None,
+    ) -> CallManifest:
+        chamber = spec.chamber
+        logical = spec.logical_model or chamber
+        requested_model = logical or spec.actor.model
+        provider = spec.actor.provider
+        resolved_model_id = spec.actor.model
+        if model_config is not None and logical is not None:
+            try:
+                mapping = model_config.resolve_chamber(logical)  # type: ignore[attr-defined]
+            except AttributeError:
+                mapping = model_config.resolve(logical)
+            provider = mapping.adapter if mapping.adapter else provider
+            resolved_model_id = mapping.model or resolved_model_id
+        # Pre-execution: revision genuinely unknown until a provider reports
+        # one. Never synthesize from timestamps.
+        requested_parameters = sanitize_effective_params(dict(spec.parameters))
+        effective = self._adapter_effective_params(spec, adapter)
+        prompt_hash = hashlib.sha256(
+            f"{spec.instruction}\0{spec.context.prompt}".encode()
+        ).hexdigest()
+        return CallManifest(
+            call_id=spec.call_id,
+            task_id=spec.task_id,
+            chamber=chamber,
+            requested_model=requested_model,
+            provider=provider,
+            resolved_model_id=resolved_model_id,
+            provider_revision=None,
+            revision_source=None,
+            pricing_version=PRICING_VERSION,
+            context_package_id=spec.context.package_id,
+            prompt_hash=prompt_hash,
+            requested_parameters=requested_parameters,
+            effective_parameters=effective,
+            created_at=now_utc(),
+        )
+
+    @staticmethod
+    def _adapter_effective_params(
+        spec: CallSpec, adapter: CognitionAdapter
+    ) -> dict[str, object]:
+        describe = getattr(adapter, "effective_request", None)
+        if callable(describe):
+            try:
+                effective = describe(spec)
+            except (ValueError, TypeError, AttributeError):
+                effective = dict(spec.parameters)
+            if isinstance(effective, Mapping):
+                return sanitize_effective_params(dict(effective))
+        return sanitize_effective_params(dict(spec.parameters))
+
+    def _record_attempt(
+        self,
+        spec: CallSpec,
+        *,
+        manifest: CallManifest,
+        result: CallResult,
+        attempt_id: str,
+        attempt_index: int,
+        started_at: str,
+        finished_at: str,
+        causation_id: str | None,
+    ) -> AttemptRecord:
+        provider = result.provider or manifest.provider
+        resolved_model_id = result.model or manifest.resolved_model_id
+        # Revision epistemics: only a provider-reported version counts as
+        # observed. A version string identical to the model id carries no
+        # extra revision information -> unknown (None).
+        reported = result.model_version
+        if reported and reported != resolved_model_id:
+            provider_revision: str | None = reported
+            revision_source: str | None = "reported"
+        else:
+            provider_revision = None
+            revision_source = None
+        usage_source = (result.usage_source or "").lower()
+        if usage_source not in ("measured", "estimated", "unavailable"):
+            usage_source = (
+                "measured"
+                if (result.input_tokens is not None or result.output_tokens is not None)
+                else "unavailable"
+            )
+        if usage_source == UsageSource.UNAVAILABLE.value:
+            in_tokens: int | None = None
+            out_tokens: int | None = None
+        else:
+            in_tokens = result.input_tokens
+            out_tokens = result.output_tokens
+        usage = Usage(
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            source=UsageSource(usage_source),
+        )
+        cost = estimate_cost_usd(resolved_model_id, in_tokens, out_tokens)
+        # Authoritative derivation: the pricing table (at pricing_version)
+        # owns rate interpretation. An adapter-supplied cost figure is NOT
+        # trusted here: for a model absent from the pricing table the cost
+        # stays unknown (None), never an adapter-claimed number and never 0.
+        # Adapter cost figures remain visible on the legacy CallResult path.
+        pricing_version = result.pricing_version or PRICING_VERSION
+        cost_source = (
+            CostSource.ESTIMATED.value if cost is not None else CostSource.UNKNOWN.value
+        )
+        status, error_kind = _classify_attempt(result)
+        latency_ms = result.latency_ms
+        if latency_ms is None:
+            latency_ms = None
+        effective = (
+            sanitize_effective_params(dict(result.effective_parameters))
+            if result.effective_parameters
+            else dict(manifest.effective_parameters)
+        )
+        raw_artifact = self._store_raw_observation(
+            spec=spec,
+            manifest=manifest,
+            result=result,
+            attempt_id=attempt_id,
+            attempt_index=attempt_index,
+            provider=provider,
+            resolved_model_id=resolved_model_id,
+            provider_revision=provider_revision,
+            revision_source=revision_source,
+            usage=usage,
+            pricing_version=pricing_version,
+            cost_usd=cost,
+            cost_source=cost_source,
+            status=status,
+            error_kind=error_kind,
+            effective=effective,
+        )
+        attempt = AttemptRecord(
+            attempt_id=attempt_id,
+            call_id=spec.call_id,
+            task_id=spec.task_id,
+            attempt_index=attempt_index,
+            started_at=result.started_at or started_at,
+            finished_at=result.completed_at or finished_at,
+            latency_ms=latency_ms,
+            provider=provider,
+            resolved_model_id=resolved_model_id,
+            provider_revision=provider_revision,
+            revision_source=revision_source,
+            protocol=result.protocol,
+            provider_request_id=result.provider_call_id or result.request_id,
+            status=status,
+            error_kind=error_kind,
+            error=result.error,
+            usage=usage,
+            pricing_version=pricing_version,
+            cost_usd=cost,
+            cost_source=cost_source,
+            currency="USD",
+            raw_artifact=raw_artifact,
+            raw_observation_kind=result.raw_observation_kind or RAW_OBSERVATION_KIND,
+            normalizer_version=result.normalizer_version or NORMALIZER_VERSION,
+            effective_parameters=effective,
+        )
+        self.ledger.append(
+            Event.create(
+                stream_id=attempt_id,
+                kind="attempt.completed",
+                actor_id=spec.actor.actor_id,
+                payload=_attempt_payload(attempt, fingerprint=result.fingerprint),
+                causation_id=causation_id,
+                correlation_id=spec.task_id,
+            )
+        )
+        return attempt
+
+    def _store_raw_observation(
+        self,
+        *,
+        spec: CallSpec,
+        manifest: CallManifest,
+        result: CallResult,
+        attempt_id: str,
+        attempt_index: int,
+        provider: str | None,
+        resolved_model_id: str | None,
+        provider_revision: str | None,
+        revision_source: str | None,
+        usage: Usage,
+        pricing_version: str | None,
+        cost_usd: float | None,
+        cost_source: str,
+        status: str,
+        error_kind: str | None,
+        effective: dict[str, object],
+    ) -> ArtifactRef | None:
+        if self.artifact_store is None:
+            return None
+        observation = {
+            "kind": result.raw_observation_kind or RAW_OBSERVATION_KIND,
+            "call_id": spec.call_id,
+            "attempt_id": attempt_id,
+            "attempt_index": attempt_index,
+            "task_id": spec.task_id,
+            "provider": provider,
+            "protocol": result.protocol,
+            "model": resolved_model_id,
+            "provider_revision": provider_revision,
+            "revision_source": revision_source,
+            "provider_call_id": result.provider_call_id,
+            "output_text": result.raw_output,
+            "provider_response": dict(result.raw_payload) if result.raw_payload else None,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "source": usage.source.value,
+            },
+            "status": status,
+            "error_kind": error_kind,
+            "error": result.error,
+            "pricing_version": pricing_version,
+            "cost_usd": cost_usd,
+            "cost_source": cost_source,
+            "currency": "USD",
+            "normalizer_version": result.normalizer_version or NORMALIZER_VERSION,
+            "effective_parameters": effective,
+        }
+        content = json.dumps(observation, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self.artifact_store.store_bytes(
+            content,
+            media_type="application/json",
+            artifact_type="raw_provider_observation",
+        )
+
+    def _interpret_attempt(
+        self,
+        spec: CallSpec,
+        *,
+        manifest: CallManifest,
+        attempt: AttemptRecord,
+        result: CallResult,
+    ) -> CallResult:
+        return replace(
+            result,
+            input_tokens=attempt.usage.input_tokens,
+            output_tokens=attempt.usage.output_tokens,
+            cost_usd=attempt.cost_usd,
+            provider=attempt.provider,
+            model=attempt.resolved_model_id,
+            model_version=result.model_version,
+            provider_call_id=result.provider_call_id,
+            request_id=result.request_id or spec.idempotency_key,
+            started_at=attempt.started_at,
+            completed_at=attempt.finished_at,
+            status="succeeded" if attempt.status == AttemptStatus.SUCCEEDED.value else "failed",
+            error_kind=attempt.error_kind,
+            usage_source=attempt.usage.source.value,
+            pricing_version=attempt.pricing_version,
+            cost_source=attempt.cost_source,
+            normalizer_version=attempt.normalizer_version,
+            attempt_id=attempt.attempt_id,
+            attempt_index=attempt.attempt_index,
+            effective_parameters=dict(attempt.effective_parameters),
+            raw_artifact=attempt.raw_artifact,
+        )
+
+    def _append_recorded_call_completed(
+        self,
+        result: CallResult,
+        *,
+        spec: CallSpec,
+        manifest: CallManifest,
+        attempts: list[AttemptRecord],
+        call_status: str,
+        totals: dict[str, float | int | None],
+        causation_id: str | None,
+    ) -> None:
+        payload = asdict(result)
+        payload["idempotency_key"] = spec.idempotency_key
+        payload["task_id"] = spec.task_id
+        payload["directive_id"] = spec.directive_id
+        payload["run_id"] = spec.run_id
+        payload["adapter_id"] = spec.adapter_id
+        payload["experiment_id"] = spec.experiment_id
+        payload["arm"] = spec.arm
+        payload["prompt_version"] = spec.prompt_version
+        payload["context_package_id"] = spec.context.package_id
+        # Recorded-cognition provenance (additive; legacy readers ignore).
+        payload["chamber"] = manifest.chamber
+        payload["requested_model"] = manifest.requested_model
+        payload["resolved_model_id"] = manifest.resolved_model_id
+        payload["provider_revision"] = attempts[-1].provider_revision if attempts else None
+        payload["revision_source"] = attempts[-1].revision_source if attempts else None
+        payload["attempt_ids"] = [attempt.attempt_id for attempt in attempts]
+        payload["attempt_count"] = len(attempts)
+        payload["call_status"] = call_status
+        payload["total_input_tokens"] = totals["input_tokens"]
+        payload["total_output_tokens"] = totals["output_tokens"]
+        payload["total_cost_usd"] = totals["cost_usd"]
+        payload["pricing_version"] = manifest.pricing_version
+        self.ledger.append(
+            Event.create(
+                stream_id=result.call_id,
+                kind="call.completed",
+                actor_id=spec.actor.actor_id,
+                payload=payload,
+                causation_id=causation_id,
+                correlation_id=spec.task_id,
+            )
+        )
 
     def sealed_fanout(
         self,
@@ -633,6 +1179,8 @@ class Runtime:
             model_version=result.model_version or spec.actor.version,
             request_id=result.request_id or spec.idempotency_key,
             raw_artifact=raw_artifact or result.raw_artifact,
+            pricing_version=result.pricing_version or PRICING_VERSION,
+            normalizer_version=result.normalizer_version or NORMALIZER_VERSION,
         )
 
     def _append_call_completed(
@@ -664,14 +1212,16 @@ class Runtime:
         raw = payload.get("raw_artifact")
         if isinstance(raw, dict):
             try:
-                raw_artifact = ArtifactRef(**raw)
+                raw_artifact = ArtifactRef(**{k: raw[k] for k in ("artifact_id", "sha256", "media_type") if k in raw} | ({"uri": raw.get("uri")} if "uri" in raw else {}))
             except TypeError:
                 raw_artifact = None
+        effective = payload.get("effective_parameters")
+        raw_payload = payload.get("raw_payload")
         return CallResult(
             call_id=str(payload["call_id"]),
             raw_output=str(payload.get("raw_output", "")),
-            input_tokens=int(payload.get("input_tokens", 0) or 0),
-            output_tokens=int(payload.get("output_tokens", 0) or 0),
+            input_tokens=_optional_int(payload.get("input_tokens")),
+            output_tokens=_optional_int(payload.get("output_tokens")),
             cost_usd=self._payload_float(payload, "cost_usd"),
             latency_ms=self._payload_int(payload, "latency_ms"),
             provider=self._payload_value(payload, "provider"),
@@ -685,6 +1235,17 @@ class Runtime:
             status=str(payload.get("status", "succeeded")),
             error=self._payload_value(payload, "error"),
             raw_artifact=raw_artifact,
+            usage_source=str(payload.get("usage_source", "measured") or "measured"),
+            error_kind=self._payload_value(payload, "error_kind"),
+            pricing_version=self._payload_value(payload, "pricing_version"),
+            cost_source=self._payload_value(payload, "cost_source"),
+            normalizer_version=self._payload_value(payload, "normalizer_version"),
+            attempt_id=self._payload_value(payload, "attempt_id"),
+            attempt_index=self._payload_int(payload, "attempt_index"),
+            effective_parameters=dict(effective) if isinstance(effective, dict) else {},
+            protocol=self._payload_value(payload, "protocol"),
+            raw_observation_kind=self._payload_value(payload, "raw_observation_kind"),
+            raw_payload=dict(raw_payload) if isinstance(raw_payload, dict) else {},
         )
 
     def _append_context_compiled(
@@ -912,3 +1473,216 @@ class Runtime:
         if self.state_resolver is None:
             return None
         return self.state_resolver()
+
+
+# ---------------- recorded-cognition payload helpers ----------------
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)  # type: ignore[arg-type]
+
+
+def _jsonable_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if is_dataclass(item):
+            out[str(key)] = asdict(item)
+        elif isinstance(item, Enum):
+            out[str(key)] = item.value
+        elif isinstance(item, Mapping):
+            out[str(key)] = _jsonable_mapping(item)
+        elif isinstance(item, (list, tuple)):
+            out[str(key)] = list(item)
+        else:
+            out[str(key)] = item
+    return out
+
+
+def _manifest_payload(manifest: CallManifest) -> dict[str, Any]:
+    return {
+        "call_id": manifest.call_id,
+        "task_id": manifest.task_id,
+        "chamber": manifest.chamber,
+        "requested_model": manifest.requested_model,
+        "provider": manifest.provider,
+        "resolved_model_id": manifest.resolved_model_id,
+        "provider_revision": manifest.provider_revision,
+        "revision_source": manifest.revision_source,
+        "pricing_version": manifest.pricing_version,
+        "context_package_id": manifest.context_package_id,
+        "prompt_hash": manifest.prompt_hash,
+        "requested_parameters": _jsonable_mapping(manifest.requested_parameters),
+        "effective_parameters": _jsonable_mapping(manifest.effective_parameters),
+        "created_at": manifest.created_at,
+    }
+
+
+def _manifest_from_payload(payload: dict[str, Any]) -> CallManifest:
+    requested = payload.get("requested_parameters")
+    effective = payload.get("effective_parameters")
+    return CallManifest(
+        call_id=str(payload["call_id"]),
+        task_id=str(payload["task_id"]),
+        chamber=payload.get("chamber"),
+        requested_model=payload.get("requested_model"),
+        provider=payload.get("provider"),
+        resolved_model_id=payload.get("resolved_model_id"),
+        provider_revision=payload.get("provider_revision"),
+        revision_source=payload.get("revision_source"),
+        pricing_version=payload.get("pricing_version"),
+        context_package_id=payload.get("context_package_id"),
+        prompt_hash=payload.get("prompt_hash"),
+        requested_parameters=dict(requested) if isinstance(requested, dict) else {},
+        effective_parameters=dict(effective) if isinstance(effective, dict) else {},
+        created_at=payload.get("created_at"),
+    )
+
+
+def _attempt_payload(attempt: AttemptRecord, *, fingerprint: str | None = None) -> dict[str, Any]:
+    return {
+        "attempt_id": attempt.attempt_id,
+        "call_id": attempt.call_id,
+        "task_id": attempt.task_id,
+        "attempt_index": attempt.attempt_index,
+        "started_at": attempt.started_at,
+        "finished_at": attempt.finished_at,
+        "latency_ms": attempt.latency_ms,
+        "provider": attempt.provider,
+        "resolved_model_id": attempt.resolved_model_id,
+        "provider_revision": attempt.provider_revision,
+        "revision_source": attempt.revision_source,
+        "protocol": attempt.protocol,
+        "provider_request_id": attempt.provider_request_id,
+        "status": attempt.status,
+        "error_kind": attempt.error_kind,
+        "error": attempt.error,
+        "usage": {
+            "input_tokens": attempt.usage.input_tokens,
+            "output_tokens": attempt.usage.output_tokens,
+            "source": attempt.usage.source.value,
+        },
+        "pricing_version": attempt.pricing_version,
+        "cost_usd": attempt.cost_usd,
+        "cost_source": attempt.cost_source,
+        "currency": attempt.currency,
+        "raw_artifact": None
+        if attempt.raw_artifact is None
+        else {
+            "artifact_id": attempt.raw_artifact.artifact_id,
+            "sha256": attempt.raw_artifact.sha256,
+            "media_type": attempt.raw_artifact.media_type,
+            "uri": attempt.raw_artifact.uri,
+        },
+        "raw_observation_kind": attempt.raw_observation_kind,
+        "normalizer_version": attempt.normalizer_version,
+        "effective_parameters": _jsonable_mapping(attempt.effective_parameters),
+        "fingerprint": fingerprint,
+    }
+
+
+def _attempt_from_payload(payload: dict[str, Any]) -> AttemptRecord:
+    usage_payload = payload.get("usage")
+    if isinstance(usage_payload, dict):
+        source_raw = str(usage_payload.get("source", "unavailable") or "unavailable").lower()
+        try:
+            source = UsageSource(source_raw)
+        except ValueError:
+            source = UsageSource.UNAVAILABLE
+        usage = Usage(
+            input_tokens=_optional_int(usage_payload.get("input_tokens")),
+            output_tokens=_optional_int(usage_payload.get("output_tokens")),
+            source=source,
+        )
+    else:
+        usage = Usage(
+            input_tokens=_optional_int(payload.get("input_tokens")),
+            output_tokens=_optional_int(payload.get("output_tokens")),
+            source=UsageSource(str(payload.get("usage_source", "unavailable") or "unavailable").lower())
+            if str(payload.get("usage_source", "")).lower() in ("measured", "estimated", "unavailable")
+            else UsageSource.UNAVAILABLE,
+        )
+    raw = payload.get("raw_artifact")
+    raw_artifact = None
+    if isinstance(raw, dict):
+        try:
+            raw_artifact = ArtifactRef(
+                artifact_id=str(raw["artifact_id"]),
+                sha256=str(raw["sha256"]),
+                media_type=str(raw.get("media_type", "application/json")),
+                uri=raw.get("uri"),
+            )
+        except KeyError:
+            raw_artifact = None
+    effective = payload.get("effective_parameters")
+    return AttemptRecord(
+        attempt_id=str(payload["attempt_id"]),
+        call_id=str(payload["call_id"]),
+        task_id=str(payload.get("task_id", "")),
+        attempt_index=int(payload.get("attempt_index", 1)),
+        started_at=payload.get("started_at"),
+        finished_at=payload.get("finished_at"),
+        latency_ms=_optional_int(payload.get("latency_ms")),
+        provider=payload.get("provider"),
+        resolved_model_id=payload.get("resolved_model_id") or payload.get("model"),
+        provider_revision=payload.get("provider_revision"),
+        revision_source=payload.get("revision_source"),
+        protocol=payload.get("protocol"),
+        provider_request_id=payload.get("provider_request_id"),
+        status=str(payload.get("status", "failed")),
+        error_kind=payload.get("error_kind"),
+        error=payload.get("error"),
+        usage=usage,
+        pricing_version=payload.get("pricing_version"),
+        cost_usd=None if payload.get("cost_usd") is None else float(payload["cost_usd"]),  # type: ignore[arg-type]
+        cost_source=str(payload.get("cost_source", "unknown") or "unknown"),
+        currency=str(payload.get("currency", "USD") or "USD"),
+        raw_artifact=raw_artifact,
+        raw_observation_kind=payload.get("raw_observation_kind"),
+        normalizer_version=payload.get("normalizer_version"),
+        effective_parameters=dict(effective) if isinstance(effective, dict) else {},
+    )
+
+
+def _classify_attempt(result: CallResult) -> tuple[str, str | None]:
+    """Derive attempt status + error kind from an adapter interpretation."""
+    if result.status == "succeeded" and result.raw_output:
+        return AttemptStatus.SUCCEEDED.value, None
+    if result.status == "succeeded" and not result.raw_output:
+        # Adapter claimed success but produced nothing observable.
+        return AttemptStatus.TRANSIENT_FAILURE.value, "empty_output"
+    error_kind = result.error_kind
+    if error_kind is None:
+        error_kind = "provider_error"
+    if error_kind in ("transient_failure", "empty_output", "timeout", "rate_limited"):
+        return AttemptStatus.TRANSIENT_FAILURE.value, error_kind
+    return AttemptStatus.FAILED.value, error_kind
+
+
+def _aggregate_totals(attempts: list[AttemptRecord]) -> dict[str, float | int | None]:
+    """Derive call-level totals from persisted attempts.
+
+    Unknowns propagate: if any attempt's usage is unknown, the call total is
+    unknown (None), never a partial sum presented as authoritative. Cost sums
+    only fully-known estimated costs.
+    """
+    total_in: int | None = 0
+    total_out: int | None = 0
+    total_cost: float | None = 0.0
+    for attempt in attempts:
+        if attempt.usage.input_tokens is None or attempt.usage.output_tokens is None:
+            total_in = None
+            total_out = None
+        else:
+            if total_in is not None:
+                total_in += attempt.usage.input_tokens
+            if total_out is not None:
+                total_out += attempt.usage.output_tokens
+        if attempt.cost_usd is None:
+            total_cost = None
+        elif total_cost is not None:
+            total_cost += attempt.cost_usd
+    if not attempts:
+        return {"input_tokens": None, "output_tokens": None, "cost_usd": None}
+    return {"input_tokens": total_in, "output_tokens": total_out, "cost_usd": total_cost}

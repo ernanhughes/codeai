@@ -44,6 +44,44 @@ class Capability(StrEnum):
     DESTRUCTIVE = "destructive"
 
 
+class UsageSource(StrEnum):
+    """Provenance of a token-usage measurement.
+
+    MEASURED: the provider reported usage for this attempt.
+    ESTIMATED: usage was derived locally (e.g. token counting), not measured.
+    UNAVAILABLE: the provider supplied no usage; token fields must be None,
+        never zero. Zero means measured zero.
+    """
+
+    MEASURED = "measured"
+    ESTIMATED = "estimated"
+    UNAVAILABLE = "unavailable"
+
+
+class AttemptStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TRANSIENT_FAILURE = "transient_failure"
+
+
+class LogicalCallStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNRESOLVED = "unresolved"
+
+
+class CostSource(StrEnum):
+    """How an attempt/call cost estimate was derived.
+
+    ESTIMATED: computed from measured/estimated usage via a pricing version.
+    UNKNOWN: model absent from the pricing table, or usage unavailable.
+        Unknown is persisted as None, never 0.
+    """
+
+    ESTIMATED = "estimated"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class ActorRef:
     actor_id: str
@@ -223,3 +261,110 @@ class CallSpec:
     # Experiment grouping (optional; ledger-recoverable analysis keys).
     experiment_id: str | None = None
     arm: str | None = None
+    # Recorded-cognition extensions (all optional for backward compatibility).
+    # chamber: logical job name (e.g. "deep-review"), resolved through
+    # ModelConfig to a concrete provider/model occupant. When None, the
+    # logical model key (if any) or actor.model is used as the request label.
+    chamber: str | None = None
+    logical_model: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """Token usage for one attempt. Unknowns are None, never zero."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    source: UsageSource = UsageSource.UNAVAILABLE
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedOccupant:
+    """Concrete model occupant selected for a chamber/logical name."""
+
+    provider: str | None = None
+    model_id: str | None = None
+    # Epistemic rule: unknown != absent != zero != inferred. A missing
+    # revision is None; never synthesize one from timestamps.
+    provider_revision: str | None = None
+    revision_source: str | None = None  # e.g. "reported" | "config" | None
+
+
+@dataclass(frozen=True, slots=True)
+class CallManifest:
+    """Immutable record of what CodeAI intended/resolved before any attempt.
+
+    The manifest records intent; attempts record observation. Persisted as a
+    ``call.manifest`` ledger event before execution.
+    """
+
+    call_id: str
+    task_id: str
+    chamber: str | None = None
+    requested_model: str | None = None
+    provider: str | None = None
+    resolved_model_id: str | None = None
+    provider_revision: str | None = None
+    revision_source: str | None = None
+    pricing_version: str | None = None
+    context_package_id: str | None = None
+    prompt_hash: str | None = None
+    requested_parameters: Mapping[str, Any] = field(default_factory=dict)
+    effective_parameters: Mapping[str, Any] = field(default_factory=dict)
+    created_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    """One provider attempt beneath a logical call.
+
+    task_id != call_id != attempt_id. attempt_index is 1-based within the call.
+    """
+
+    attempt_id: str
+    call_id: str
+    task_id: str
+    attempt_index: int
+    started_at: str | None = None
+    finished_at: str | None = None
+    latency_ms: int | None = None
+    provider: str | None = None
+    resolved_model_id: str | None = None
+    provider_revision: str | None = None
+    revision_source: str | None = None
+    # Wire dialect that produced this attempt, e.g. "responses" |
+    # "chat_completions" | "messages". Gateway stays in `provider`; the two
+    # are never conflated.
+    protocol: str | None = None
+    provider_request_id: str | None = None
+    status: str = AttemptStatus.FAILED.value
+    error_kind: str | None = None
+    error: str | None = None
+    usage: Usage = field(default_factory=Usage)
+    pricing_version: str | None = None
+    cost_usd: float | None = None
+    cost_source: str = CostSource.UNKNOWN.value
+    currency: str = "USD"
+    raw_artifact: ArtifactRef | None = None
+    raw_observation_kind: str | None = None
+    normalizer_version: str | None = None
+    effective_parameters: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCall:
+    """Logical call with its manifest, attempts, and final interpretation.
+
+    Cognition completion (status) is distinct from task completion: a
+    succeeded call only means the cognition operation produced an output.
+    """
+
+    call_id: str
+    task_id: str
+    chamber: str | None
+    manifest: CallManifest
+    attempts: tuple[AttemptRecord, ...]
+    status: str = LogicalCallStatus.UNRESOLVED.value
+    total_input_tokens: int | None = None
+    total_output_tokens: int | None = None
+    total_cost_usd: float | None = None
