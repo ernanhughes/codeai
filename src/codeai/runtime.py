@@ -68,6 +68,23 @@ from .domain import (
     UsageSource,
     Variant,
 )
+from .evidence import (
+    ClaimExtraction,
+    ClaimStanding,
+    DecisionRequest,
+    DecisionStanding,
+    EvidenceRecord,
+    decisions_resting_on,
+    project_claim_standing,
+    project_decision_standing,
+    record_decision,
+)
+from .evidence import (
+    extract_claim as _extract_claim,
+)
+from .evidence import (
+    record_evidence as _record_evidence,
+)
 from .interpretation import (
     ATTEMPT_POLICY_V2,
     INTERPRETER_V2,
@@ -328,6 +345,44 @@ class Runtime:
     def task_completion(self, task_id: str) -> TaskCompletion:
         """Project task completion from the ledger without appending."""
         return project_task_completion(self, task_id)
+
+    # ------------------------------------------------------------------
+    # Claims, evidence and decisions: see codeai.evidence (Stage 18)
+    # ------------------------------------------------------------------
+
+    def extract_claim(self, request: ClaimExtraction) -> ClaimStanding:
+        """Attribute a claim to an exact span of preserved output; it starts unresolved.
+
+        Raises ClaimRefused (after recording claim.refused) when the span, quote or
+        observation cannot be validated.
+        """
+        return _extract_claim(self, request)
+
+    def record_claim_evidence(self, request: EvidenceRecord) -> ClaimStanding:
+        """Record a validated source passage or targeted check for a claim.
+
+        Raises EvidenceRefused (after recording claim.evidence_refused).
+        """
+        return _record_evidence(self, request)
+
+    def claim_standing(self, claim_id: str) -> ClaimStanding | None:
+        """Project a claim's status and evidence class from recorded evidence; appends nothing."""
+        return project_claim_standing(self, claim_id)
+
+    def record_decision(self, request: DecisionRequest) -> DecisionStanding:
+        """Record a decision with a snapshot of the claims it relies on.
+
+        Raises DecisionRefused (after recording decision.refused).
+        """
+        return record_decision(self, request)
+
+    def decision_standing(self, decision_id: str) -> DecisionStanding:
+        """Compare a decision's recorded basis with the claims' standing now; appends nothing."""
+        return project_decision_standing(self, decision_id)
+
+    def decisions_resting_on(self, claim_id: str) -> tuple[DecisionStanding, ...]:
+        """Every recorded decision that relied on a claim, with its standing now."""
+        return decisions_resting_on(self, claim_id)
 
     # ------------------------------------------------------------------
     # Working state: restart is reopening; resume is knowing what is safe next
