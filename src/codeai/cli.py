@@ -638,6 +638,12 @@ def _experiment_command(runtime: Runtime, args: argparse.Namespace) -> int:
         if not arms:
             print("define at least one arm: --c0, --c1, or --h1", file=sys.stderr)
             return 1
+        if args.allow_unknown_cost and not (args.unknown_cost_reason or "").strip():
+            print(
+                "error: --allow-unknown-cost requires --unknown-cost-reason",
+                file=sys.stderr,
+            )
+            return 1
         config = build_config(
             name=args.name,
             hypothesis=args.hypothesis,

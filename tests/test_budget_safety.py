@@ -96,6 +96,29 @@ def corpus_tasks(ids=("off-by-one-sum", "inverted-comparison-adult")) -> tuple[C
 # A. one known single-attempt call ---------------------------------------------
 
 
+def test_override_requires_reason_at_config_time():
+    import pytest
+
+    from codeai.experiments import ArmDef, ExperimentBudget, build_config
+
+    with pytest.raises(ValueError, match="unknown_cost_reason"):
+        build_config(
+            name="t",
+            hypothesis="h",
+            task_ids=("a",),
+            arms=(ArmDef(name="C0", models=("m",), samples=1),),
+            budget=ExperimentBudget(allow_unknown_cost=True, unknown_cost_reason="  "),
+        )
+    with pytest.raises(ValueError, match="unknown_cost_reason"):
+        build_config(
+            name="t",
+            hypothesis="h",
+            task_ids=("a",),
+            arms=(ArmDef(name="C0", models=("m",), samples=1),),
+            budget=ExperimentBudget(allow_unknown_cost=True),
+        )
+
+
 def test_known_single_attempt_reports_complete_totals(tmp_path):
     import pytest
 

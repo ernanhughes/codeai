@@ -120,6 +120,12 @@ def build_config(
     stopping_rule: str = "stop when budget exhausted; record incomplete arms explicitly",
 ) -> ExperimentConfig:
     eid = experiment_id or str(uuid.uuid4())
+    resolved_budget = budget or ExperimentBudget()
+    if resolved_budget.allow_unknown_cost and not (resolved_budget.unknown_cost_reason or "").strip():
+        raise ValueError(
+            "allow_unknown_cost=True requires a non-empty unknown_cost_reason: "
+            "an override without a recorded reason is not permitted"
+        )
     body = {
         "experiment_id": eid,
         "name": name,
