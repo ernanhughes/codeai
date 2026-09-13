@@ -22,6 +22,7 @@ from .adapters import (
     sanitize_effective_params,
 )
 from .domain import CallSpec
+from .rendering import compose_model_input
 
 
 class ProviderError(RuntimeError):
@@ -603,6 +604,13 @@ class OpenAICompatibleAdapter(CognitionAdapter):
 
 
 def _opencode_input_text(spec: CallSpec) -> str:
+    if spec.rendered_context is not None:
+        # Stage 15B: the request carries the rendered selection, laid out as
+        # instruction, context, query (see codeai.rendering).
+        text, _layout = compose_model_input(
+            spec.instruction, spec.rendered_context, spec.context.prompt
+        )
+        return text
     instruction = spec.instruction or ""
     prompt = spec.context.prompt or ""
     return f"{instruction}\n\n{prompt}".strip() or prompt or instruction

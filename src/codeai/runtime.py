@@ -73,6 +73,14 @@ from .interpretation import (
 from .ledger import Event, SQLiteLedger
 from .policy import AuthorityDenied, PolicyEngine
 from .providers import PRICING_VERSION, estimate_cost_usd
+from .rendering import (
+    KNOWN_RENDERERS,
+    ContextResolutionError,
+    RenderBindingError,
+    compose_model_input,
+    prepared_input_text,
+    render_context,
+)
 
 
 class PreconditionMismatch(RuntimeError):
@@ -447,6 +455,15 @@ class Runtime:
         """Recorded invocation returning (recorded call, final result, replayed)."""
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        if spec.context_render is not None:
+            # Rendering is bound to a request only through prepare(); refuse
+            # before any event rather than record an unbindable call.
+            if spec.context_render not in KNOWN_RENDERERS:
+                raise ValueError(f"unknown context renderer version: {spec.context_render!r}")
+            if not callable(getattr(adapter, "prepare", None)):
+                raise ValueError("context rendering requires an adapter with prepare()/send()")
+        # The runtime renders; a caller-supplied rendering is never trusted.
+        spec = replace(spec, rendered_context=None)
         request_event = Event.create(
             stream_id=spec.call_id,
             kind="call.requested",
@@ -455,6 +472,23 @@ class Runtime:
             correlation_id=spec.task_id,
         )
         self.ledger.append(request_event)
+
+        rendered = None
+        if spec.context_render is not None:
+            try:
+                rendered = render_context(
+                    spec.context,
+                    ledger=self.ledger,
+                    artifact_store=self.artifact_store,
+                    version=spec.context_render,
+                )
+            except ContextResolutionError as exc:
+                self._append_preparation_failed(
+                    spec, request_event, stage="context_render",
+                    details={"unresolved": list(exc.unresolved)},
+                )
+                raise
+            spec = replace(spec, rendered_context=rendered)
 
         replayed_completion = self._find_recorded_completion(spec.idempotency_key)
         if replayed_completion is not None:
@@ -497,8 +531,23 @@ class Runtime:
         # invoke path unchanged.
         prepare = getattr(adapter, "prepare", None)
         prepared = prepare(spec) if callable(prepare) else None
+        input_layout: tuple[dict[str, Any], ...] = ()
+        if rendered is not None and prepared is not None:
+            composed, input_layout = compose_model_input(
+                spec.instruction, rendered, spec.context.prompt
+            )
+            if prepared_input_text(prepared.body) != composed:
+                self._append_preparation_failed(
+                    spec, request_event, stage="render_binding",
+                    details={"rendered_context_sha256": rendered.sha256},
+                )
+                raise RenderBindingError("prepared request does not carry the rendered model input")
+            if self.artifact_store is not None:
+                self.artifact_store.store_text(
+                    rendered.text, media_type="text/plain", artifact_type="rendered_context"
+                )
         if prepared is not None:
-            manifest = self._build_manifest_from_prepared(spec, prepared)
+            manifest = self._build_manifest_from_prepared(spec, prepared, input_layout=input_layout)
         else:
             manifest = self._build_manifest(spec, adapter=adapter, model_config=model_config)
         self.ledger.append(
@@ -727,14 +776,16 @@ class Runtime:
 
     def _check_replay_fingerprint(self, spec: CallSpec, original: RecordedCall) -> None:
         """Reject same-key, materially-different requests before any effect."""
+        rendered_sha = spec.rendered_context.sha256 if spec.rendered_context is not None else None
         expected = (
             original.manifest.prompt_hash,
             original.manifest.chamber,
             original.manifest.requested_model,
+            original.manifest.rendered_context_sha256,
         )
-        actual = _request_fingerprint(spec)
+        actual = (*_request_fingerprint(spec), rendered_sha)
         if actual != expected:
-            dimensions = ("prompt_hash", "chamber", "requested_model")
+            dimensions = ("prompt_hash", "chamber", "requested_model", "rendered_context_sha256")
             mismatched = sorted(
                 dimension
                 for dimension, want, got in zip(dimensions, expected, actual)
@@ -744,6 +795,37 @@ class Runtime:
                 f"idempotency key {spec.idempotency_key!r} matches completed call "
                 f"{original.call_id!r} but the request differs in: {', '.join(mismatched)}"
             )
+
+    def _append_preparation_failed(
+        self,
+        spec: CallSpec,
+        request_event: Event,
+        *,
+        stage: str,
+        details: Mapping[str, object],
+    ) -> None:
+        """Record a failure after call.requested and before any provider effect.
+
+        No manifest or attempt follows, so the call can never read as succeeded.
+        """
+        self.ledger.append(
+            Event.create(
+                stream_id=spec.call_id,
+                kind="call.preparation_failed",
+                actor_id=spec.actor.actor_id,
+                payload={
+                    "call_id": spec.call_id,
+                    "task_id": spec.task_id,
+                    "stage": stage,
+                    "context_package_id": spec.context.package_id,
+                    "context_render_version": spec.context_render,
+                    "provider_effect": False,
+                    **dict(details),
+                },
+                causation_id=request_event.event_id,
+                correlation_id=spec.task_id,
+            )
+        )
 
     # ---------------- recorded-call internals ----------------
 
@@ -791,7 +873,11 @@ class Runtime:
         )
 
     def _build_manifest_from_prepared(
-        self, spec: CallSpec, prepared: PreparedCognitionRequest
+        self,
+        spec: CallSpec,
+        prepared: PreparedCognitionRequest,
+        *,
+        input_layout: tuple[dict[str, Any], ...] = (),
     ) -> CallManifest:
         """Build the call manifest from the single prepared request.
 
@@ -805,6 +891,7 @@ class Runtime:
         prompt_hash = hashlib.sha256(
             f"{spec.instruction}\0{spec.context.prompt}".encode()
         ).hexdigest()
+        rendered = spec.rendered_context
         return CallManifest(
             call_id=spec.call_id,
             task_id=spec.task_id,
@@ -825,6 +912,12 @@ class Runtime:
             request_plan_version=prepared.plan_version,
             request_body_sha256=prepared.body_sha256,
             created_at=now_utc(),
+            context_render_version=rendered.version if rendered is not None else None,
+            rendered_context_sha256=rendered.sha256 if rendered is not None else None,
+            rendered_items=(
+                tuple(asdict(item) for item in rendered.items) if rendered is not None else ()
+            ),
+            input_layout=tuple(dict(part) for part in input_layout),
         )
 
     @staticmethod
@@ -2416,6 +2509,10 @@ def _manifest_payload(manifest: CallManifest) -> dict[str, Any]:
         "request_plan_version": manifest.request_plan_version,
         "request_body_sha256": manifest.request_body_sha256,
         "created_at": manifest.created_at,
+        "context_render_version": manifest.context_render_version,
+        "rendered_context_sha256": manifest.rendered_context_sha256,
+        "rendered_items": [dict(item) for item in manifest.rendered_items],
+        "input_layout": [dict(part) for part in manifest.input_layout],
     }
 
 
@@ -2445,6 +2542,10 @@ def _manifest_from_payload(payload: dict[str, Any]) -> CallManifest:
         request_plan_version=payload.get("request_plan_version"),
         request_body_sha256=payload.get("request_body_sha256"),
         created_at=payload.get("created_at"),
+        context_render_version=payload.get("context_render_version"),
+        rendered_context_sha256=payload.get("rendered_context_sha256"),
+        rendered_items=tuple(dict(item) for item in payload.get("rendered_items") or ()),
+        input_layout=tuple(dict(part) for part in payload.get("input_layout") or ()),
     )
 
 

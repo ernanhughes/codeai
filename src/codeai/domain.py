@@ -244,6 +244,35 @@ class ContextPackage:
 
 
 @dataclass(frozen=True, slots=True)
+class RenderedItem:
+    """One selected item inside rendered context bytes.
+
+    content_sha256 identifies the resolved source bytes; start/end are the
+    byte offsets of those bytes within RenderedContext.text (UTF-8).
+    """
+
+    kind: str
+    item_id: str
+    content_sha256: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedContext:
+    """Exact context bytes rendered from a ContextPackage (see codeai.rendering).
+
+    package_id stays a selection identity; sha256 identifies the rendered bytes.
+    """
+
+    version: str
+    package_id: str
+    text: str
+    sha256: str
+    items: tuple[RenderedItem, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class CallSpec:
     call_id: str
     task_id: str
@@ -270,6 +299,13 @@ class CallSpec:
     # logical model key (if any) or actor.model is used as the request label.
     chamber: str | None = None
     logical_model: str | None = None
+    # Context rendering (Stage 15B). context_render names a renderer version
+    # and opts the call in: the runtime resolves the package's selected items
+    # to bytes and the request text is built from them. rendered_context is
+    # set by the runtime and never trusted from the caller. None keeps the
+    # legacy behaviour, in which the package is a selection record only.
+    context_render: str | None = None
+    rendered_context: RenderedContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +364,19 @@ class CallManifest:
     request_plan_version: str | None = None
     request_body_sha256: str | None = None
     created_at: str | None = None
+    # Context rendering provenance (Stage 15B, additive; None/() for calls
+    # that did not render context):
+    # - context_package_id (above) stays the selection identity.
+    # - rendered_context_sha256: the exact rendered context bytes, also the
+    #   artifact id under which those bytes are stored.
+    # - rendered_items: per selected item, its resolved content sha256 and
+    #   byte offsets inside the rendered context.
+    # - input_layout: byte offsets and sha256 of the instruction, context and
+    #   query parts inside the model input text carried by the request body.
+    context_render_version: str | None = None
+    rendered_context_sha256: str | None = None
+    rendered_items: tuple[Mapping[str, Any], ...] = ()
+    input_layout: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
