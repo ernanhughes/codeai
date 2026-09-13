@@ -198,7 +198,8 @@ class PreparedCognitionRequest:
     - routing: public non-secret routing metadata (e.g. session id).
     - public_headers: exact non-secret headers to send (credentials are
       applied structurally by transport and never appear here).
-    - body: the exact JSON body to submit. Persisted only as body_sha256;
+    - body: the semantic JSON object to submit. body_sha256 hashes canonical JSON,
+      not outbound HTTP bytes;
       prompt content stays referenced via context provenance, not duplicated.
     """
 
@@ -229,6 +230,8 @@ class PreparedCognitionRequest:
             "endpoint": self.endpoint,
             "model": self.model,
         }
+        if "gateway_plan" in self.routing:
+            effective["gateway_plan"] = self.routing["gateway_plan"]
         session_id = self.routing.get("session_id")
         if session_id is not None:
             effective["session_id"] = session_id

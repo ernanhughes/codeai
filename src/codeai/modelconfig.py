@@ -26,6 +26,7 @@ class ModelMapping:
     # Wire dialect for gateways that support several, e.g. OpenCode Zen:
     # "responses" | "chat_completions" | "messages". None = adapter default.
     protocol: str | None = None
+    gateway_plan: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,7 @@ class ModelConfig:
                 model=mapping.model,
                 base_url=mapping.base_url or OPENCODE_ZEN_BASE_URL,
                 protocol=mapping.protocol or "responses",
+                gateway_plan=mapping.gateway_plan,
             )
         if mapping.adapter == "fake":
             from .adapters import FakeCognitionAdapter
@@ -105,6 +107,7 @@ def load_model_config(path: str | Path | None = None) -> ModelConfig:
             base_url=entry.get("base_url"),
             provider=entry.get("provider"),
             protocol=entry.get("protocol"),
+            gateway_plan=entry.get("gateway_plan"),
         )
     return ModelConfig(models=models)
 

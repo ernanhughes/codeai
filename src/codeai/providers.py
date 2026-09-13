@@ -655,6 +655,7 @@ def _classify_opencode_error(exc: ProviderError) -> str:
 OPENCODE_ENDPOINTS = {
     "responses": "/v1/responses",
     "chat_completions": "/v1/chat/completions",
+    "messages": "/v1/messages",
 }
 
 # Request-preparation contract identifier. Persisted on new manifests; the
@@ -676,6 +677,13 @@ _OPENCODE_CONTROLS: dict[str, dict[str, dict[str, object]]] = {
         "seed": {"kind": "unsupported"},
     },
     "chat_completions": {
+        "temperature": {"kind": "direct"},
+        "max_tokens": {"kind": "direct", "coerce": "int"},
+        "max_output_tokens": {"kind": "alias", "target": "max_tokens", "coerce": "int"},
+        "reasoning_effort": {"kind": "unsupported"},
+        "seed": {"kind": "unsupported"},
+    },
+    "messages": {
         "temperature": {"kind": "direct"},
         "max_tokens": {"kind": "direct", "coerce": "int"},
         "max_output_tokens": {"kind": "alias", "target": "max_tokens", "coerce": "int"},
@@ -731,6 +739,20 @@ def _chat_text(parsed: dict[str, Any]) -> str:
     return str(content)
 
 
+def _messages_text(parsed: dict[str, Any]) -> str:
+    """Text-only Messages boundary; preserve ignored blocks in observation."""
+    content = parsed.get("content")
+    if not isinstance(content, list):
+        raise ProviderError("OpenCode Messages payload contained no content blocks")
+    texts = [block["text"] for block in content
+             if isinstance(block, dict) and block.get("type") == "text"
+             and isinstance(block.get("text"), str)]
+    text = "".join(texts)
+    if not text.strip():
+        raise ProviderError("OpenCode Messages payload contained no output text")
+    return text
+
+
 @dataclass
 class OpenCodeCognitionAdapter(CognitionAdapter):
     """OpenCode Zen gateway as a first-class cognition adapter.
@@ -760,6 +782,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
     # otherwise generated per invoke and recorded on the attempt (transport
     # routing, not a secret and not a generation control).
     session_id: str | None = None
+    gateway_plan: str | None = None  # configured identity; never inferred from model
 
     def __post_init__(self) -> None:
         if self.api_key is None:
@@ -832,7 +855,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
             "model": self.model,
             **(
                 {"messages": [{"role": "user", "content": _opencode_input_text(spec)}]}
-                if self.protocol == "chat_completions"
+                if self.protocol in ("chat_completions", "messages")
                 else {"input": _opencode_input_text(spec)}
             ),
         }
@@ -866,6 +889,12 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 for part in path[:-1]:
                     effective_nested = effective_nested.setdefault(str(part), {})
                 effective_nested[str(path[-1])] = wire_value
+        defaulted: dict[str, Any] = {}
+        if self.protocol == "messages":
+            if "max_tokens" not in body:
+                body["max_tokens"] = effective["max_tokens"] = defaulted["max_tokens"] = 1024
+            if body["max_tokens"] <= 0:
+                raise InvalidControlError("max_tokens", "Messages requires a positive limit")
         session_id = self._resolve_session()
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return PreparedCognitionRequest(
@@ -877,14 +906,16 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
             requested_controls=requested,
             effective_controls=effective,
             omitted_unsupported=tuple(sorted(omitted)),
-            defaulted_controls={},
-            routing={"session_id": session_id},
+            defaulted_controls=defaulted,
+            routing={"session_id": session_id, "gateway_plan": self.gateway_plan},
             public_headers={
                 "User-Agent": self.user_agent,
                 "x-opencode-session": session_id,
+                **({"anthropic-version": "2023-06-01"} if self.protocol == "messages" else {}),
             },
             body_sha256=hashlib.sha256(canonical).hexdigest(),
-            plan_version=OPENCODE_REQUEST_PLAN,
+            plan_version=("opencode-messages-request-plan-v1"
+                          if self.protocol == "messages" else OPENCODE_REQUEST_PLAN),
         )
 
     def send(self, prepared: PreparedCognitionRequest) -> CallResult:
@@ -907,6 +938,8 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 "Authorization": f"Bearer {key}",
                 **{str(k): str(v) for k, v in prepared.public_headers.items()},
             }
+            if prepared.protocol == "messages":
+                headers["x-api-key"] = key
             reply = post(
                 f"{self.base_url.rstrip('/')}{prepared.endpoint}",
                 dict(prepared.body),
@@ -937,7 +970,8 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 in_tokens, in_reported = _extract_usage(raw_usage, "prompt_tokens")
                 out_tokens, out_reported = _extract_usage(raw_usage, "completion_tokens")
             else:
-                text = _responses_text(parsed)
+                text = (_messages_text(parsed) if self.protocol == "messages"
+                        else _responses_text(parsed))
                 raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
                 in_tokens, in_reported = _extract_usage(raw_usage, "input_tokens")
                 out_tokens, out_reported = _extract_usage(raw_usage, "output_tokens")
