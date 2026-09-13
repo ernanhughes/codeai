@@ -525,3 +525,22 @@ def test_recorded_gateway_failure_is_attempt_not_task_completion(tmp_path):
     assert recorded.attempts[0].provider == "opencode"
     kinds = [e.kind for e in runtime.ledger.read_all()]
     assert "task.completed" not in kinds
+
+
+def test_recorded_call_completed_carries_logical_call_id(tmp_path):
+    """Regression exposed by Stage 14: the gateway adapter's send() returns
+    call_id="" and call.completed inherited it, leaving its stream and payload
+    call_id empty (visible in the Stage 12 live ledgers)."""
+    runtime = make_runtime(tmp_path)
+    adapter = OpenCodeCognitionAdapter(
+        model="mimo-v2.5",
+        protocol="chat_completions",
+        api_key="zen-test-key",
+        http_post=lambda *a: chat_fixture(prompt_tokens=10, completion_tokens=5),
+    )
+    recorded = runtime.invoke_recorded_call(make_spec(), adapter=adapter)
+    [completed] = runtime.ledger.events_by_kind(("call.completed",))
+    assert completed.stream_id == recorded.call_id == "call-oc-1"
+    assert completed.payload["call_id"] == "call-oc-1"
+    reopened = runtime.get_recorded_call("call-oc-1")
+    assert reopened.status == completed.payload["call_status"]

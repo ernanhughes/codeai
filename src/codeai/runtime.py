@@ -1425,6 +1425,9 @@ class Runtime:
     ) -> CallResult:
         return replace(
             result,
+            # The logical call identity comes from the spec: gateway adapters'
+            # send() returns an empty call_id, which call.completed must not inherit.
+            call_id=spec.call_id,
             input_tokens=attempt.usage.input_tokens,
             output_tokens=attempt.usage.output_tokens,
             cost_usd=attempt.cost_usd,
