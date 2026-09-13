@@ -151,7 +151,12 @@ def test_http_400_full_body_and_old_label(tmp_path):
         make_spec(), adapter=zen_adapter(HttpResponse(400, {}, body, "application/json"))
     )
     attempt = recorded.attempts[0]
-    assert recorded.status == "failed" and attempt.error_kind == "provider_error"
+    # 11.5b execution uses v2: generic request error, not provider_error.
+    assert recorded.status == "failed" and attempt.error_kind == "invalid_request"
+    assert "MissingSessionID" in (attempt.error or "")
+    # v1 replay reproduces the historical label from the same evidence.
+    v1 = runtime.interpret_attempt_as(attempt.attempt_id, version="attempt-interpretation-v1")
+    assert v1 is not None and v1.error_kind == "provider_error"
     obs = observed_for(runtime, attempt.attempt_id)
     assert obs["transport_outcome"] == "http_error" and obs["http_status"] == 400
     assert runtime.artifact_store.read_bytes(obs["response_body_artifact"]["artifact_id"]) == body
@@ -176,7 +181,14 @@ def test_http_403_body_beyond_byte_500_survives(tmp_path):
     recorded = runtime.invoke_recorded_call(
         make_spec(), adapter=zen_adapter(HttpResponse(403, {}, body, "application/json"))
     )
-    assert recorded.attempts[0].error_kind == "authentication_error"  # old label kept
+    # 11.5b execution uses v2: a bare 403 without a recognised signature is
+    # refusal, not proof of invalid credentials.
+    assert recorded.attempts[0].error_kind == "provider_error"
+    # v1 replay reproduces the historical overclaim from the same evidence.
+    v1 = runtime.interpret_attempt_as(
+        recorded.attempts[0].attempt_id, version="attempt-interpretation-v1"
+    )
+    assert v1 is not None and v1.error_kind == "authentication_error"
     stored = runtime.artifact_store.read_bytes(
         observed_for(runtime, recorded.attempts[0].attempt_id)["response_body_artifact"][
             "artifact_id"
@@ -360,9 +372,18 @@ def test_event_order_success_error_noresponse(tmp_path):
         make_spec("call-nr"),
         adapter=zen_adapter(TransportFailure("TimeoutError", "provider request failed: t/o")),
     )
-    per_call = ["call.requested", "call.manifest", "attempt.started", "attempt.observed"]
-    # attempt.completed is appended right after the legacy envelope, then call.completed
-    per_call += ["attempt.completed", "call.completed"]
+    per_call = [
+        "call.requested",
+        "call.manifest",
+        "attempt.started",
+        "attempt.observed",
+        "attempt.interpreted",
+        "attempt.retry_decided",
+        # legacy envelope stored, then compatibility projection:
+        "attempt.completed",
+        "call.status_decided",
+        "call.completed",
+    ]
     assert [e.kind for e in runtime.ledger.read_all()] == per_call * 3
 
 
@@ -372,9 +393,11 @@ def test_observed_precedes_completed_in_sequence(tmp_path):
         make_spec(), adapter=zen_adapter(HttpResponse(200, {}, chat_body(), None))
     )
     kinds = [e.kind for e in runtime.ledger.read_all()]
-    assert kinds.index("attempt.observed") < kinds.index("attempt.completed")
-    assert kinds.index("attempt.started") < kinds.index("attempt.observed")
-    assert kinds.index("attempt.completed") < kinds.index("call.completed")
+    assert kinds.index("attempt.observed") < kinds.index("attempt.interpreted")
+    assert kinds.index("attempt.interpreted") < kinds.index("attempt.retry_decided")
+    assert kinds.index("attempt.retry_decided") < kinds.index("attempt.completed")
+    assert kinds.index("attempt.completed") < kinds.index("call.status_decided")
+    assert kinds.index("call.status_decided") < kinds.index("call.completed")
 
 
 # O. restart ----------------------------------------------------------------------------------------

@@ -349,6 +349,12 @@ class AttemptRecord:
     raw_observation_kind: str | None = None
     normalizer_version: str | None = None
     effective_parameters: Mapping[str, Any] = field(default_factory=dict)
+    # Compatibility projection provenance (Stage 11.5b): status/error_kind
+    # above project the execution-time interpretation + policy decision named
+    # here. They are not timeless facts; see attempt.interpreted and
+    # attempt.retry_decided. None for pre-11.5b records.
+    interpretation_id: str | None = None
+    policy_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,3 +374,66 @@ class RecordedCall:
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
     total_cost_usd: float | None = None
+
+
+class GenerationState(StrEnum):
+    """Provider-evidenced generation completion, independent of transport."""
+
+    COMPLETE = "complete"
+    TRUNCATED = "truncated"
+    FILTERED = "filtered"
+    EMPTY = "empty"
+    UNKNOWN = "unknown"
+
+
+class ClassificationBasis(StrEnum):
+    """How an error classification was reached. The basis is representation;
+    the label taxonomy it justifies is versioned separately."""
+
+    STATUS_ONLY = "status_only"
+    BODY_SIGNATURE = "body_signature"
+    EXCEPTION_TYPE = "exception_type"
+    PARSER_FAILURE = "parser_failure"
+    GENERATION_STATE = "generation_state"
+    CONFIGURATION = "configuration"
+    ADAPTER_REPORTED = "adapter_reported"
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptInterpretation:
+    """One immutable interpretation of one attempt's preserved evidence.
+
+    Observation (attempt.observed / derived input) is evidence; this record
+    is a conclusion under a named interpreter version. Same observation +
+    different version -> different records; older records are never
+    overwritten. Contains no policy answers (no retry/call_success).
+    """
+
+    interpretation_id: str
+    attempt_id: str
+    call_id: str
+    task_id: str
+    observation_event_id: str | None = None
+    response_body_artifact: ArtifactRef | None = None
+    interpreter_version: str = ""
+    completion_map_version: str | None = None
+    classifier_version: str | None = None
+    created_at: str | None = None
+    transport_state: str = ""
+    generation_state: str = GenerationState.UNKNOWN.value
+    provider_reason: str | None = None
+    provider_reason_source: str | None = None
+    error_kind: str | None = None
+    classification_basis: str | None = None
+    basis_detail: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptDecision:
+    """Policy answer derived from one interpretation. Persisted as
+    attempt.retry_decided / call.status_decided; never part of the
+    interpretation itself."""
+
+    decision: str = "terminal"  # accept | retry | terminal
+    reason: str = ""
+    executed: bool = True

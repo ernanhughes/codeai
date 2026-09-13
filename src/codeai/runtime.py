@@ -32,6 +32,8 @@ from .context import CompilationTrace, ContextCompiler
 from .domain import (
     ActorRef,
     ArtifactRef,
+    AttemptDecision,
+    AttemptInterpretation,
     AttemptRecord,
     AttemptStatus,
     Authority,
@@ -52,6 +54,13 @@ from .domain import (
     UsageSource,
     Variant,
 )
+from .interpretation import (
+    ATTEMPT_POLICY_V2,
+    INTERPRETER_V2,
+    InterpretationInput,
+    decide_attempt,
+    interpret_attempt,
+)
 from .ledger import Event, SQLiteLedger
 from .policy import AuthorityDenied, PolicyEngine
 from .providers import PRICING_VERSION, estimate_cost_usd
@@ -59,14 +68,6 @@ from .providers import PRICING_VERSION, estimate_cost_usd
 
 class PreconditionMismatch(RuntimeError):
     pass
-
-
-# Attempt classifications that may be retried inside one logical call when the
-# caller explicitly opts into more than one attempt (max_attempts > 1).
-# This is a representability seam, not an autonomous retry policy: the default
-# is max_attempts=1 (no retry), and no backoff, swapping, or scoring happens
-# here.
-RETRYABLE_ERROR_KINDS = ("transient_failure", "empty_output", "rate_limited")
 
 
 def now_utc() -> str:
@@ -339,7 +340,8 @@ class Runtime:
         *,
         adapter: CognitionAdapter,
         max_attempts: int = 1,
-        retry_on: tuple[str, ...] = RETRYABLE_ERROR_KINDS,
+        interpreter_version: str = INTERPRETER_V2,
+        policy_version: str = ATTEMPT_POLICY_V2,
         model_config: Any | None = None,
     ) -> RecordedCall:
         """Execute one logical cognition call with explicit attempt accounting.
@@ -347,11 +349,21 @@ class Runtime:
         Crash-window contract (clean-restart durability only, no atomicity
         claims): the sequence per attempt is ``attempt.started`` -> provider
         effect -> response-body blob stored -> ``attempt.observed`` appended
-        -> legacy mixed envelope stored -> ``attempt.completed`` appended,
-        then ``call.completed``. Ambiguity windows, from newest evidence
-        backwards:
-        - crash after ``attempt.observed`` but before ``attempt.completed``:
-          transport observation exists, interpretation completion absent;
+        -> ``attempt.interpreted`` appended -> ``attempt.retry_decided``
+        appended -> legacy mixed envelope stored -> ``attempt.completed``
+        appended, then ``call.status_decided`` and ``call.completed``.
+        Ambiguity windows, from newest evidence backwards:
+        - crash after ``attempt.interpreted`` but before ``attempt.retry_decided``:
+          interpretation exists, decision absent (do not infer the decision;
+          the deterministic policy can re-derive it, but re-derivation is not
+          silently recorded as history);
+        - crash after ``attempt.observed`` but before ``attempt.interpreted``:
+          transport observation exists without interpretation; recoverable by
+          re-running the recorded interpreter version, transparently;
+        - decision says retry, crash before the next ``attempt.started``:
+          intent to retry exists with no second provider effect;
+        - decision says no retry, crash before ``attempt.completed``:
+          policy intent exists though the compatibility projection is absent;
         - crash after body-blob storage but before ``attempt.observed``:
           an unreferenced content-addressed response body may exist;
         - crash between the provider effect and body storage: only
@@ -366,8 +378,9 @@ class Runtime:
         nothing about correctness, support, authorization, or verification.
 
         No automatic retry policy lives here: ``max_attempts`` defaults to 1.
-        Passing ``max_attempts > 1`` explicitly opts into bounded re-attempts
-        for classifications in ``retry_on`` within this single logical call.
+        Passing ``max_attempts > 1`` explicitly bounds re-attempts; whether
+        any single attempt is retried is decided by the versioned attempt
+        policy from that attempt's interpretation, never by heuristics here.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -393,6 +406,8 @@ class Runtime:
         )
 
         attempts: list[AttemptRecord] = []
+        interpretations: list[AttemptInterpretation] = []
+        decisions: list[AttemptDecision] = []
         last_result: CallResult | None = None
         for attempt_index in range(1, max_attempts + 1):
             attempt_id = str(uuid.uuid4())
@@ -436,7 +451,7 @@ class Runtime:
                     completed_at=now_utc(),
                 )
             finished_at = now_utc()
-            attempt = self._record_attempt(
+            attempt, interpretation, decision = self._record_attempt(
                 spec,
                 manifest=manifest,
                 result=observed,
@@ -445,20 +460,36 @@ class Runtime:
                 started_at=started_at,
                 finished_at=finished_at,
                 causation_id=request_event.event_id,
+                interpreter_version=interpreter_version,
+                policy_version=policy_version,
+                max_attempts=max_attempts,
             )
             attempts.append(attempt)
+            interpretations.append(interpretation)
+            decisions.append(decision)
             last_result = self._interpret_attempt(spec, manifest=manifest, attempt=attempt, result=observed)
-            if attempt.status == AttemptStatus.SUCCEEDED.value:
-                break
-            if attempt_index < max_attempts and (attempt.error_kind in retry_on):
+            if decision.executed:
                 continue
             break
 
         assert last_result is not None
-        call_status = (
-            LogicalCallStatus.SUCCEEDED.value
-            if attempts and attempts[-1].status == AttemptStatus.SUCCEEDED.value
-            else LogicalCallStatus.FAILED.value
+        call_status, status_reason = _decide_call_status(attempts, interpretations, decisions)
+        self.ledger.append(
+            Event.create(
+                stream_id=spec.call_id,
+                kind="call.status_decided",
+                actor_id=spec.actor.actor_id,
+                payload={
+                    "call_id": spec.call_id,
+                    "task_id": spec.task_id,
+                    "status": call_status,
+                    "reason": status_reason,
+                    "interpretation_ids": [i.interpretation_id for i in interpretations],
+                    "policy_version": policy_version,
+                },
+                causation_id=request_event.event_id,
+                correlation_id=spec.task_id,
+            )
         )
         totals = _aggregate_totals(attempts)
         self._append_recorded_call_completed(
@@ -469,6 +500,10 @@ class Runtime:
             call_status=call_status,
             totals=totals,
             causation_id=request_event.event_id,
+            decision_basis_interpretation_id=(
+                interpretations[-1].interpretation_id if interpretations else None
+            ),
+            decision_policy_version=policy_version,
         )
         return RecordedCall(
             call_id=spec.call_id,
@@ -614,7 +649,10 @@ class Runtime:
         started_at: str,
         finished_at: str,
         causation_id: str | None,
-    ) -> AttemptRecord:
+        interpreter_version: str = INTERPRETER_V2,
+        policy_version: str = ATTEMPT_POLICY_V2,
+        max_attempts: int = 1,
+    ) -> tuple[AttemptRecord, AttemptInterpretation, AttemptDecision]:
         provider = result.provider or manifest.provider
         resolved_model_id = result.model or manifest.resolved_model_id
         # Revision epistemics: only a provider-reported version counts as
@@ -655,7 +693,6 @@ class Runtime:
         cost_source = (
             CostSource.ESTIMATED.value if cost is not None else CostSource.UNKNOWN.value
         )
-        status, error_kind = _classify_attempt(result)
         latency_ms = result.latency_ms
         if latency_ms is None:
             latency_ms = None
@@ -664,10 +701,10 @@ class Runtime:
             if result.effective_parameters
             else dict(manifest.effective_parameters)
         )
-        # Pure transport evidence first: body bytes (if any) -> blob, then the
-        # attempt.observed event. The legacy mixed envelope below is kept
-        # unchanged for compatibility; interpretation still flows from result.
-        self._store_transport_observation(
+        # Transport evidence first: body bytes (if any) -> blob, then the
+        # attempt.observed event. Interpretation follows observation;
+        # decisions follow interpretation.
+        observed_event_id, body_ref = self._store_transport_observation(
             spec=spec,
             result=result,
             attempt_id=attempt_id,
@@ -675,6 +712,53 @@ class Runtime:
             provider=provider,
             causation_id=causation_id,
         )
+        interpretation = interpret_attempt(
+            _interpretation_input(spec, manifest, result, attempt_id),
+            version=interpreter_version,
+            observation_event_id=observed_event_id,
+            response_body_artifact=body_ref,
+        )
+        self._append_attempt_interpreted(
+            spec=spec, interpretation=interpretation, causation_id=causation_id
+        )
+        decision_name, decision_reason = decide_attempt(
+            interpretation,
+            policy_version=policy_version,
+            has_output_text=bool(result.raw_output),
+        )
+        executed = decision_name == "retry" and attempt_index < max_attempts
+        decision = AttemptDecision(decision=decision_name, reason=decision_reason, executed=executed)
+        self.ledger.append(
+            Event.create(
+                stream_id=attempt_id,
+                kind="attempt.retry_decided",
+                actor_id=spec.actor.actor_id,
+                payload={
+                    "attempt_id": attempt_id,
+                    "call_id": spec.call_id,
+                    "task_id": spec.task_id,
+                    "decision": decision.decision,
+                    "reason": decision.reason,
+                    "executed": decision.executed,
+                    "interpretation_id": interpretation.interpretation_id,
+                    "policy_version": policy_version,
+                },
+                causation_id=causation_id,
+                correlation_id=spec.task_id,
+            )
+        )
+        # Compatibility projections: status/error_kind mirror the
+        # execution-time interpretation + policy, exactly as the old
+        # classifier produced (accept->succeeded, retry->transient_failure,
+        # terminal->failed). Authoritative provenance lives in the
+        # interpreted/decided events, not here.
+        if decision.decision == "accept":
+            status = AttemptStatus.SUCCEEDED.value
+        elif decision.decision == "retry":
+            status = AttemptStatus.TRANSIENT_FAILURE.value
+        else:
+            status = AttemptStatus.FAILED.value
+        error_kind = interpretation.error_kind
         raw_artifact = self._store_raw_observation(
             spec=spec,
             manifest=manifest,
@@ -719,6 +803,8 @@ class Runtime:
             raw_observation_kind=result.raw_observation_kind or RAW_OBSERVATION_KIND,
             normalizer_version=result.normalizer_version or NORMALIZER_VERSION,
             effective_parameters=effective,
+            interpretation_id=interpretation.interpretation_id,
+            policy_version=policy_version,
         )
         self.ledger.append(
             Event.create(
@@ -730,7 +816,7 @@ class Runtime:
                 correlation_id=spec.task_id,
             )
         )
-        return attempt
+        return attempt, interpretation, decision
 
     def _store_raw_observation(
         self,
@@ -799,22 +885,23 @@ class Runtime:
         attempt_index: int,
         provider: str | None,
         causation_id: str | None,
-    ) -> None:
+    ) -> tuple[str | None, ArtifactRef | None]:
         """Persist pure transport evidence for one attempt, if the adapter saw any.
 
         Stores the exact response body bytes (when they exist) as a
         content-addressed blob, then appends attempt.observed with transport
-        metadata and the blob reference. Adapters without transport evidence
-        (fakes, legacy dict fixtures) produce no event: absent observation
-        means unavailable under this schema, never an empty observation.
+        metadata and the blob reference. Returns (observed_event_id, body_ref).
+        Adapters without transport evidence (fakes, legacy dict fixtures)
+        produce no event: absent observation means unavailable under this
+        schema, never an empty observation.
         """
         transport = result.transport
         if transport is None or self.artifact_store is None:
             if transport is None:
-                return
+                return None, None
             # No artifact store: observation cannot be preserved; record the
             # metadata anyway so the transport outcome is not silently lost.
-            self._append_attempt_observed(
+            event_id = self._append_attempt_observed(
                 spec=spec,
                 result=result,
                 attempt_id=attempt_id,
@@ -824,7 +911,7 @@ class Runtime:
                 byte_length=None,
                 causation_id=causation_id,
             )
-            return
+            return event_id, None
         body_ref = None
         byte_length = None
         if transport.body is not None:
@@ -835,7 +922,7 @@ class Runtime:
             )
             record = self.ledger.read_artifact(body_ref.artifact_id)
             byte_length = record.byte_length if record is not None else len(transport.body)
-        self._append_attempt_observed(
+        event_id = self._append_attempt_observed(
             spec=spec,
             result=result,
             attempt_id=attempt_id,
@@ -845,6 +932,7 @@ class Runtime:
             byte_length=byte_length,
             causation_id=causation_id,
         )
+        return event_id, body_ref
 
     def _append_attempt_observed(
         self,
@@ -857,7 +945,7 @@ class Runtime:
         body_ref: ArtifactRef | None,
         byte_length: int | None,
         causation_id: str | None,
-    ) -> None:
+    ) -> str:
         transport = result.transport
         assert transport is not None
         event = Event.create(
@@ -905,6 +993,192 @@ class Runtime:
                 return dict(event.payload)
         return None
 
+    def _append_attempt_interpreted(
+        self,
+        *,
+        spec: CallSpec,
+        interpretation: AttemptInterpretation,
+        causation_id: str | None,
+    ) -> str:
+        event = Event.create(
+            stream_id=interpretation.attempt_id,
+            kind="attempt.interpreted",
+            actor_id=spec.actor.actor_id,
+            payload=_interpretation_payload(interpretation),
+            causation_id=causation_id,
+            correlation_id=spec.task_id,
+        )
+        self.ledger.append(event)
+        return event.event_id
+
+    def interpretations_for_attempt(self, attempt_id: str) -> list[AttemptInterpretation]:
+        """All persisted interpretations for one attempt, in ledger order."""
+        return [
+            _interpretation_from_payload(event.payload)
+            for event in self.ledger.events_by_kind(("attempt.interpreted",))
+            if event.stream_id == attempt_id
+            or str(event.payload.get("attempt_id", "")) == attempt_id
+        ]
+
+    def interpret_attempt_as(
+        self, attempt_id: str, *, version: str
+    ) -> AttemptInterpretation | None:
+        """Recompute an interpretation of preserved evidence without appending.
+
+        Pure projection: loads the attempt.observed event (when present),
+        the response-body bytes (when referenced), and the compatibility
+        fields of attempt.completed, then runs the named interpreter version.
+        Returns None when the attempt has no completed record to project from.
+        History is never modified; the result carries a fresh
+        interpretation_id that belongs to no ledger event.
+        """
+        completed = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("attempt.completed",))
+                if str(event.payload.get("attempt_id", "")) == attempt_id
+            ),
+            None,
+        )
+        if completed is None:
+            return None
+        finished = completed.payload
+        observed = self.get_attempt_observation(attempt_id)
+        body: bytes | None = None
+        if observed is not None:
+            ref = observed.get("response_body_artifact")
+            if isinstance(ref, dict) and self.artifact_store is not None:
+                try:
+                    body = self.artifact_store.read_bytes(str(ref["artifact_id"]))
+                except (FileNotFoundError, KeyError, RuntimeError):
+                    body = None
+        output_text = ""
+        parsed: dict[str, Any] = {}
+        raw_ref = finished.get("raw_artifact")
+        if isinstance(raw_ref, dict) and self.artifact_store is not None:
+            try:
+                envelope = json.loads(
+                    self.artifact_store.read_text(str(raw_ref["artifact_id"]))
+                )
+                if isinstance(envelope, dict):
+                    output_text = str(envelope.get("output_text", "") or "")
+                    provider_response = envelope.get("provider_response")
+                    if isinstance(provider_response, dict):
+                        parsed = provider_response
+            except (FileNotFoundError, KeyError, RuntimeError, ValueError):
+                pass
+        if observed is not None:
+            transport_outcome: str | None = str(observed.get("transport_outcome"))
+            http_status = observed.get("http_status")
+            http_status = None if http_status is None else int(http_status)
+            exception_type = observed.get("exception_type")
+            observation_event_id = next(
+                (
+                    event.event_id
+                    for event in self.ledger.events_by_kind(("attempt.observed",))
+                    if event.stream_id == attempt_id
+                    or str(event.payload.get("attempt_id", "")) == attempt_id
+                ),
+                None,
+            )
+            ref = observed.get("response_body_artifact")
+            body_artifact = None
+            if isinstance(ref, dict):
+                try:
+                    body_artifact = ArtifactRef(
+                        artifact_id=str(ref["artifact_id"]),
+                        sha256=str(ref["sha256"]),
+                        media_type=str(ref.get("media_type", "application/octet-stream")),
+                        uri=ref.get("uri"),
+                    )
+                except KeyError:
+                    body_artifact = None
+        else:
+            transport_outcome = None
+            http_status = None
+            exception_type = None
+            observation_event_id = None
+            body_artifact = None
+        error_text = finished.get("error")
+        entry = InterpretationInput(
+            attempt_id=attempt_id,
+            call_id=str(finished.get("call_id", "")),
+            task_id=str(finished.get("task_id", "")),
+            protocol=finished.get("protocol"),
+            transport_outcome=transport_outcome,
+            http_status=http_status,
+            exception_type=exception_type,
+            failure_message=str(error_text) if error_text is not None else None,
+            body_bytes=body,
+            parsed=parsed,
+            output_text=output_text,
+            adapter_status="failed" if error_text else "succeeded",
+            adapter_error_kind=finished.get("error_kind"),
+        )
+        return interpret_attempt(
+            entry,
+            version=version,
+            observation_event_id=observation_event_id,
+            response_body_artifact=body_artifact,
+        )
+
+    def project_call_as(
+        self, call_id: str, *, interpreter_version: str, policy_version: str
+    ) -> dict[str, Any] | None:
+        """Counterfactual call projection under named versions, without writes.
+
+        Reinterprets every attempt of the call and re-decides, returning the
+        status history *would* have produced. Never claims to be what the
+        runtime decided at the time; see call.status_decided for that.
+        """
+        recorded = self.get_recorded_call(call_id)
+        if recorded is None:
+            return None
+        per_attempt = []
+        for attempt in recorded.attempts:
+            reinterpreted = self.interpret_attempt_as(
+                attempt.attempt_id, version=interpreter_version
+            )
+            if reinterpreted is None:
+                continue
+            decision, reason = decide_attempt(
+                reinterpreted,
+                policy_version=policy_version,
+                has_output_text=bool(self._envelope_output_text(attempt)),
+            )
+            per_attempt.append(
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "attempt_index": attempt.attempt_index,
+                    "interpretation_id": reinterpreted.interpretation_id,
+                    "error_kind": reinterpreted.error_kind,
+                    "generation_state": reinterpreted.generation_state,
+                    "decision": decision,
+                    "reason": reason,
+                }
+            )
+        status = _projected_call_status(per_attempt)
+        return {
+            "call_id": call_id,
+            "interpreter_version": interpreter_version,
+            "policy_version": policy_version,
+            "status": status,
+            "attempts": per_attempt,
+        }
+
+    def _envelope_output_text(self, attempt: AttemptRecord) -> str:
+        """Best-effort output text for policy projection from the preserved envelope."""
+        raw = attempt.raw_artifact
+        if raw is None or self.artifact_store is None:
+            return ""
+        try:
+            envelope = json.loads(self.artifact_store.read_text(raw.artifact_id))
+        except (FileNotFoundError, KeyError, RuntimeError, ValueError):
+            return ""
+        if isinstance(envelope, dict):
+            return str(envelope.get("output_text", "") or "")
+        return ""
+
     def _interpret_attempt(
         self,
         spec: CallSpec,
@@ -947,6 +1221,8 @@ class Runtime:
         call_status: str,
         totals: dict[str, float | int | None],
         causation_id: str | None,
+        decision_basis_interpretation_id: str | None = None,
+        decision_policy_version: str | None = None,
     ) -> None:
         payload = _call_result_event_payload(result)
         payload["idempotency_key"] = spec.idempotency_key
@@ -967,6 +1243,8 @@ class Runtime:
         payload["attempt_ids"] = [attempt.attempt_id for attempt in attempts]
         payload["attempt_count"] = len(attempts)
         payload["call_status"] = call_status
+        payload["decision_basis_interpretation_id"] = decision_basis_interpretation_id
+        payload["decision_policy_version"] = decision_policy_version
         payload["total_input_tokens"] = totals["input_tokens"]
         payload["total_output_tokens"] = totals["output_tokens"]
         payload["total_cost_usd"] = totals["cost_usd"]
@@ -1609,6 +1887,138 @@ class Runtime:
 # ---------------- recorded-cognition payload helpers ----------------
 
 
+def _interpretation_input(
+    spec: CallSpec, manifest: CallManifest, result: CallResult, attempt_id: str
+) -> InterpretationInput:
+    """Assemble preserved evidence for the interpreter. Conclusions live in
+    the interpretation, never here."""
+    transport = result.transport
+    parsed = result.raw_payload
+    return InterpretationInput(
+        attempt_id=attempt_id,
+        call_id=spec.call_id,
+        task_id=spec.task_id,
+        protocol=result.protocol,
+        transport_outcome=transport.outcome if transport is not None else None,
+        http_status=transport.status_code if transport is not None else None,
+        exception_type=transport.exception_type if transport is not None else None,
+        failure_message=result.error,
+        body_bytes=transport.body if transport is not None else None,
+        parsed=dict(parsed) if isinstance(parsed, Mapping) else {},
+        output_text=result.raw_output or "",
+        adapter_status=result.status,
+        adapter_error_kind=result.error_kind,
+    )
+
+
+def _interpretation_payload(interpretation: AttemptInterpretation) -> dict[str, Any]:
+    ref = interpretation.response_body_artifact
+    return {
+        "interpretation_id": interpretation.interpretation_id,
+        "attempt_id": interpretation.attempt_id,
+        "call_id": interpretation.call_id,
+        "task_id": interpretation.task_id,
+        "observation_event_id": interpretation.observation_event_id,
+        "response_body_artifact": None
+        if ref is None
+        else {
+            "artifact_id": ref.artifact_id,
+            "sha256": ref.sha256,
+            "media_type": ref.media_type,
+            "uri": ref.uri,
+        },
+        "interpreter_version": interpretation.interpreter_version,
+        "completion_map_version": interpretation.completion_map_version,
+        "classifier_version": interpretation.classifier_version,
+        "created_at": interpretation.created_at,
+        "transport_state": interpretation.transport_state,
+        "generation_state": interpretation.generation_state,
+        "provider_reason": interpretation.provider_reason,
+        "provider_reason_source": interpretation.provider_reason_source,
+        "error_kind": interpretation.error_kind,
+        "classification_basis": interpretation.classification_basis,
+        "basis_detail": _jsonable_mapping(interpretation.basis_detail),
+    }
+
+
+def _interpretation_from_payload(payload: dict[str, Any]) -> AttemptInterpretation:
+    ref = payload.get("response_body_artifact")
+    body_artifact = None
+    if isinstance(ref, dict):
+        try:
+            body_artifact = ArtifactRef(
+                artifact_id=str(ref["artifact_id"]),
+                sha256=str(ref["sha256"]),
+                media_type=str(ref.get("media_type", "application/octet-stream")),
+                uri=ref.get("uri"),
+            )
+        except KeyError:
+            body_artifact = None
+    detail = payload.get("basis_detail")
+    return AttemptInterpretation(
+        interpretation_id=str(payload["interpretation_id"]),
+        attempt_id=str(payload["attempt_id"]),
+        call_id=str(payload.get("call_id", "")),
+        task_id=str(payload.get("task_id", "")),
+        observation_event_id=payload.get("observation_event_id"),
+        response_body_artifact=body_artifact,
+        interpreter_version=str(payload.get("interpreter_version", "")),
+        completion_map_version=payload.get("completion_map_version"),
+        classifier_version=payload.get("classifier_version"),
+        created_at=payload.get("created_at"),
+        transport_state=str(payload.get("transport_state", "")),
+        generation_state=str(payload.get("generation_state", "unknown")),
+        provider_reason=payload.get("provider_reason"),
+        provider_reason_source=payload.get("provider_reason_source"),
+        error_kind=payload.get("error_kind"),
+        classification_basis=payload.get("classification_basis"),
+        basis_detail=dict(detail) if isinstance(detail, dict) else {},
+    )
+
+
+def _decide_call_status(
+    attempts: list[AttemptRecord],
+    interpretations: list[AttemptInterpretation],
+    decisions: list[AttemptDecision],
+) -> tuple[str, str]:
+    """Project the logical-call status from the final execution-time decision.
+
+    Accepted final attempt -> succeeded. A terminal truncated/filtered
+    generation is not completed cognition -> unresolved (least overclaiming
+    among the existing compatible statuses). Anything else -> failed.
+    """
+    if not attempts or not decisions:
+        return LogicalCallStatus.UNRESOLVED.value, "no attempts recorded"
+    last_decision = decisions[-1]
+    last_interpretation = interpretations[-1] if interpretations else None
+    generation = last_interpretation.generation_state if last_interpretation else "unknown"
+    if last_decision.decision == "accept":
+        return LogicalCallStatus.SUCCEEDED.value, "final attempt accepted"
+    if last_decision.decision == "retry":
+        return (
+            LogicalCallStatus.FAILED.value,
+            "retry decided but attempt budget exhausted",
+        )
+    if generation in ("truncated", "filtered"):
+        return (
+            LogicalCallStatus.UNRESOLVED.value,
+            f"generation {generation}, not treated as completed cognition",
+        )
+    return LogicalCallStatus.FAILED.value, f"terminal: {last_decision.reason}"
+
+
+def _projected_call_status(per_attempt: list[dict[str, Any]]) -> str:
+    """Counterfactual status for project_call_as: same rule, no persistence."""
+    if not per_attempt:
+        return LogicalCallStatus.UNRESOLVED.value
+    last = per_attempt[-1]
+    if last["decision"] == "accept":
+        return LogicalCallStatus.SUCCEEDED.value
+    if last["generation_state"] in ("truncated", "filtered"):
+        return LogicalCallStatus.UNRESOLVED.value
+    return LogicalCallStatus.FAILED.value
+
+
 def _call_result_event_payload(result: CallResult) -> dict[str, Any]:
     """Serialize a CallResult for ledger/export payloads.
 
@@ -1754,6 +2164,8 @@ def _attempt_payload(attempt: AttemptRecord, *, fingerprint: str | None = None) 
         "normalizer_version": attempt.normalizer_version,
         "effective_parameters": _jsonable_mapping(attempt.effective_parameters),
         "fingerprint": fingerprint,
+        "interpretation_id": attempt.interpretation_id,
+        "policy_version": attempt.policy_version,
     }
 
 
@@ -1817,22 +2229,9 @@ def _attempt_from_payload(payload: dict[str, Any]) -> AttemptRecord:
         raw_observation_kind=payload.get("raw_observation_kind"),
         normalizer_version=payload.get("normalizer_version"),
         effective_parameters=dict(effective) if isinstance(effective, dict) else {},
+        interpretation_id=payload.get("interpretation_id"),
+        policy_version=payload.get("policy_version"),
     )
-
-
-def _classify_attempt(result: CallResult) -> tuple[str, str | None]:
-    """Derive attempt status + error kind from an adapter interpretation."""
-    if result.status == "succeeded" and result.raw_output:
-        return AttemptStatus.SUCCEEDED.value, None
-    if result.status == "succeeded" and not result.raw_output:
-        # Adapter claimed success but produced nothing observable.
-        return AttemptStatus.TRANSIENT_FAILURE.value, "empty_output"
-    error_kind = result.error_kind
-    if error_kind is None:
-        error_kind = "provider_error"
-    if error_kind in ("transient_failure", "empty_output", "timeout", "rate_limited"):
-        return AttemptStatus.TRANSIENT_FAILURE.value, error_kind
-    return AttemptStatus.FAILED.value, error_kind
 
 
 def _aggregate_totals(attempts: list[AttemptRecord]) -> dict[str, float | int | None]:
