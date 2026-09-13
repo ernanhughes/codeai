@@ -74,6 +74,20 @@ def now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class ObservationUnavailable(RuntimeError):
+    """The preserved observation needed to interpret an attempt cannot be read.
+
+    Interpretation never substitutes a CodeAI-derived copy (the legacy decoded
+    envelope) for provider bytes that an observation references but that are
+    missing or no longer match their recorded hash.
+    """
+
+    def __init__(self, attempt_id: str, reason: str) -> None:
+        self.attempt_id = attempt_id
+        self.reason = reason
+        super().__init__(f"observation unavailable for attempt {attempt_id}: {reason}")
+
+
 @dataclass(frozen=True, slots=True)
 class InterpretationInput:
     """Evidence assembled for one interpretation. All fields are preserved

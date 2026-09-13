@@ -36,7 +36,7 @@ from .adapters import (
     VerificationAdapter,
     sanitize_effective_params,
 )
-from .artifacts import FileArtifactStore
+from .artifacts import ArtifactCorruptionError, FileArtifactStore
 from .context import (
     CompilationTrace,
     ContextBudgetUnsatisfiable,
@@ -72,6 +72,7 @@ from .interpretation import (
     ATTEMPT_POLICY_V2,
     INTERPRETER_V2,
     InterpretationInput,
+    ObservationUnavailable,
     decide_attempt,
     interpret_attempt,
 )
@@ -1349,6 +1350,9 @@ class Runtime:
         the response-body bytes (when referenced), and the compatibility
         fields of attempt.completed, then runs the named interpreter version.
         Returns None when the attempt has no completed record to project from.
+        Raises ObservationUnavailable when the observation references response
+        bytes that are missing or corrupt: the derived envelope is never used
+        in their place.
         History is never modified; the result carries a fresh
         interpretation_id that belongs to no ledger event.
         """
@@ -1368,10 +1372,22 @@ class Runtime:
         if observed is not None:
             ref = observed.get("response_body_artifact")
             if isinstance(ref, dict) and self.artifact_store is not None:
+                # The observation names these bytes; never fall back to the
+                # CodeAI-derived envelope when they cannot be read.
                 try:
                     body = self.artifact_store.read_bytes(str(ref["artifact_id"]))
-                except (FileNotFoundError, KeyError, RuntimeError):
-                    body = None
+                except FileNotFoundError as exc:
+                    raise ObservationUnavailable(
+                        attempt_id, "response body bytes are missing"
+                    ) from exc
+                except ArtifactCorruptionError as exc:
+                    raise ObservationUnavailable(
+                        attempt_id, "response body bytes do not match their recorded sha256"
+                    ) from exc
+                except KeyError as exc:
+                    raise ObservationUnavailable(
+                        attempt_id, "response body reference is malformed"
+                    ) from exc
         output_text = ""
         parsed: dict[str, Any] = {}
         raw_ref = finished.get("raw_artifact")

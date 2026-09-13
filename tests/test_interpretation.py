@@ -533,3 +533,27 @@ def test_policy_versions_reproduce_and_diverge(tmp_path):
     assert decide_attempt(v2_ok, policy_version=ATTEMPT_POLICY_V2)[0] == "accept"
     v2_trunc = interpret_attempt(CORPUS[1][1], version=INTERPRETER_V2)
     assert decide_attempt(v2_trunc, policy_version=ATTEMPT_POLICY_V2)[0] == "terminal"
+
+
+def test_projection_refuses_when_response_bytes_are_missing_or_corrupt(tmp_path):
+    """Regression exposed while building Stage 17: with the observation's response
+    body corrupted or deleted, interpret_attempt_as used to fall back to the
+    CodeAI-derived envelope and still name the observation's artifact."""
+    import pytest
+
+    from codeai.interpretation import ObservationUnavailable
+
+    runtime = make_runtime(tmp_path)
+    body = json.dumps(chat_parsed("length")).encode()
+    recorded = runtime.invoke_recorded_call(
+        make_spec(), adapter=zen_chat(HttpResponse(200, {}, body, "application/json"))
+    )
+    attempt_id = recorded.attempts[0].attempt_id
+    ref = runtime.get_attempt_observation(attempt_id)["response_body_artifact"]
+    path = Path(runtime.ledger.read_artifact(ref["artifact_id"]).uri)
+    path.write_bytes(body.replace(b"length", b"stop!!"))
+    with pytest.raises(ObservationUnavailable, match="sha256"):
+        runtime.interpret_attempt_as(attempt_id, version=INTERPRETER_V2)
+    path.unlink()
+    with pytest.raises(ObservationUnavailable, match="missing"):
+        runtime.interpret_attempt_as(attempt_id, version=INTERPRETER_V2)
