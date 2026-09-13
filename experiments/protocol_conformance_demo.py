@@ -167,7 +167,7 @@ def offline(output, captures):
                     assert hashlib.sha256(body).hexdigest() == fixture['body_sha256']
                     obs = fixture['source_observation']
                     cases.append(('captured', HttpResponse(obs['http_status'],
-                        obs.get('response_headers', {}), body, obs.get('content_type')),
+                        obs.get('headers', {}), body, obs.get('content_type')),
                         'captured_transport_bytes', fixture))
             for name, reply, evidence_class, fixture in cases:
                 sent = []
@@ -235,7 +235,7 @@ def main():
     else:
         live(args.output)
     write(args.output / 'hashes.json', {str(p.relative_to(args.output)): hashlib.sha256(p.read_bytes()).hexdigest()
-          for p in sorted(args.output.rglob('*')) if p.is_file() and p.suffix != '.sqlite'})
+          for p in sorted(args.output.rglob('*')) if p.is_file() and not p.name.startswith('ledger.sqlite')})
 
 
 if __name__ == '__main__':
