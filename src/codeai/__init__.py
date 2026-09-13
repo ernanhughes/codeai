@@ -74,6 +74,7 @@ from .experiments import (
 from .ledger import ArtifactRecord, Event, SQLiteLedger
 from .modelconfig import ModelConfig, ModelMapping, load_model_config
 from .providers import (
+    OPENCODE_ENDPOINTS,
     OPENCODE_ZEN_API_KEY_ENV,
     OPENCODE_ZEN_BASE_URL,
     AnthropicAdapter,
@@ -105,6 +106,7 @@ __all__ = [
     "MINIMALITY",
     "NORMAL",
     "NORMALIZER_VERSION",
+    "OPENCODE_ENDPOINTS",
     "OPENCODE_ZEN_API_KEY_ENV",
     "OPENCODE_ZEN_BASE_URL",
     "RAW_OBSERVATION_KIND",

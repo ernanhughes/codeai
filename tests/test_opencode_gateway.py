@@ -43,6 +43,17 @@ def responses_fixture(text=FIXTURE_TEXT, **usage):
     return payload
 
 
+def chat_fixture(text=FIXTURE_TEXT, **usage):
+    payload = {
+        "id": "chatcmpl-zen-1",
+        "model": "mimo-v2.5",
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+    }
+    if usage:
+        payload["usage"] = usage
+    return payload
+
+
 def make_spec(call_id="call-oc-1", task_id="task-oc-1", parameters=None):
     actor = ActorRef(actor_id="reviewer-1", kind="model", provider="opencode", model="mimo-v2.5")
     package = ContextCompiler().compile(
@@ -134,6 +145,124 @@ def test_missing_zen_credential_is_failed_result(monkeypatch):
 def test_unsupported_protocol_rejected_explicitly():
     with pytest.raises(ValueError, match="unsupported OpenCode protocol"):
         OpenCodeCognitionAdapter(model="mimo-v2.5", api_key="k", protocol="smoke-signals")
+
+
+# --- chat_completions codec ------------------------------------------------------
+
+
+def chat_adapter(**kwargs):
+    kwargs.setdefault("model", "mimo-v2.5")
+    kwargs.setdefault("api_key", "zen-test-key")
+    kwargs.setdefault("protocol", "chat_completions")
+    return OpenCodeCognitionAdapter(**kwargs)
+
+
+def test_chat_targets_chat_completions_endpoint():
+    seen = {}
+
+    def fake_post(url, payload, headers, timeout):
+        seen.update(url=url, payload=payload, headers=headers)
+        return chat_fixture(prompt_tokens=10, completion_tokens=5)
+
+    result = chat_adapter(base_url="https://zen.example/v9", http_post=fake_post).invoke(
+        make_spec()
+    )
+    assert seen["url"] == "https://zen.example/v9/v1/chat/completions"
+    assert seen["payload"]["model"] == "mimo-v2.5"
+    assert seen["payload"]["messages"] == [
+        {"role": "user", "content": seen["payload"]["messages"][0]["content"]}
+    ]
+    assert "The service processes every request" in seen["payload"]["messages"][0]["content"]
+    assert seen["payload"]["max_tokens"] == 512
+    assert "reasoning" not in seen["payload"]  # Responses-only control never sent here
+    assert result.status == "succeeded"
+
+
+def test_chat_extraction_and_gateway_identity():
+    # Chat usage vocab is prompt/completion tokens; a foreign key is ignored,
+    # and partially-reported usage stays partially unknown.
+    result = chat_adapter(http_post=lambda *a: chat_fixture(prompt_tokens=10)).invoke(make_spec())
+    assert result.raw_output == FIXTURE_TEXT
+    assert result.provider == "opencode"
+    assert result.protocol == "chat_completions"
+    assert result.provider_call_id == "chatcmpl-zen-1"
+    assert result.input_tokens == 10 and result.output_tokens is None
+    assert result.usage_source == "measured"
+
+
+def test_chat_known_usage_is_measured():
+    result = chat_adapter(
+        http_post=lambda *a: chat_fixture(prompt_tokens=100, completion_tokens=50)
+    ).invoke(make_spec())
+    assert (result.input_tokens, result.output_tokens) == (100, 50)
+    assert result.usage_source == "measured"
+
+
+def test_chat_malformed_and_empty_are_failures():
+    malformed = chat_adapter(http_post=lambda *a: {"id": "x", "choices": []})
+    assert malformed.invoke(make_spec()).status == "failed"
+    empty = chat_adapter(
+        http_post=lambda *a: {"id": "x", "choices": [{"message": {"content": ""}}]}
+    )
+    failed = empty.invoke(make_spec())
+    assert failed.status == "failed"
+    assert failed.raw_output == ""
+
+
+def test_chat_effective_request_has_no_reasoning_effort():
+    adapter = chat_adapter()
+    effective = adapter.effective_request(
+        make_spec(parameters={"reasoning_effort": "low", "max_tokens": 512})
+    )
+    assert effective["gateway"] == "opencode"
+    assert effective["protocol"] == "chat_completions"
+    assert effective["endpoint"] == "/v1/chat/completions"
+    assert effective["max_tokens"] == 512
+    assert "reasoning_effort" not in effective
+    assert "Authorization" not in json.dumps(effective)
+
+
+def test_session_header_sent_and_recorded_not_secret():
+    seen = {}
+
+    def fake_post(url, payload, headers, timeout):
+        seen["headers"] = headers
+        return chat_fixture(prompt_tokens=1, completion_tokens=1)
+
+    adapter = chat_adapter(session_id="sess-test-1", http_post=fake_post)
+    result = adapter.invoke(make_spec())
+    assert seen["headers"]["x-opencode-session"] == "sess-test-1"
+    assert result.effective_parameters["session_id"] == "sess-test-1"
+    assert result.status == "succeeded"
+
+
+def test_session_generated_when_unconfigured_and_recorded():
+    seen = {}
+
+    def fake_post(url, payload, headers, timeout):
+        seen["headers"] = headers
+        return chat_fixture(prompt_tokens=1, completion_tokens=1)
+
+    adapter = chat_adapter(http_post=fake_post)
+    first = adapter.invoke(make_spec())
+    second = adapter.invoke(make_spec())
+    assert seen["headers"]["x-opencode-session"] == second.effective_parameters["session_id"]
+    assert first.effective_parameters["session_id"] != second.effective_parameters["session_id"]
+
+
+def test_responses_and_chat_routes_stay_distinguishable():
+    responses = OpenCodeCognitionAdapter(
+        model="mimo-v2.5",
+        api_key="k",
+        protocol="responses",
+        http_post=lambda *a: responses_fixture(input_tokens=1, output_tokens=1),
+    )
+    chat = chat_adapter(http_post=lambda *a: chat_fixture(prompt_tokens=1, completion_tokens=1))
+    r_result, c_result = responses.invoke(make_spec()), chat.invoke(make_spec())
+    assert (r_result.protocol, c_result.protocol) == ("responses", "chat_completions")
+    assert r_result.provider == c_result.provider == "opencode"
+    assert r_result.effective_parameters["endpoint"] == "/v1/responses"
+    assert c_result.effective_parameters["endpoint"] == "/v1/chat/completions"
 
 
 # --- extraction -----------------------------------------------------------------
@@ -258,16 +387,41 @@ def test_config_round_trip_with_protocol(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".codeai").mkdir()
     (tmp_path / ".codeai" / "config.toml").write_text(
-        '[models.deep-review]\nadapter = "opencode"\nmodel = "mimo-v2.5"\nprotocol = "responses"\n'
+        '[models.deep-review]\nadapter = "opencode"\nmodel = "mimo-v2.5"\nprotocol = "chat_completions"\n'
     )
     config = load_model_config()
     mapping = config.resolve_chamber("deep-review")
     assert mapping.adapter == "opencode"
     assert mapping.model == "mimo-v2.5"
-    assert mapping.protocol == "responses"
+    assert mapping.protocol == "chat_completions"
     adapter = config.build_adapter("deep-review")
     assert isinstance(adapter, OpenCodeCognitionAdapter)
-    assert adapter.protocol == "responses"
+    assert adapter.protocol == "chat_completions"
+
+
+def test_build_adapter_honors_mapping_protocol():
+    config = ModelConfig(
+        models={
+            "review": ModelMapping(
+                logical_name="review",
+                adapter="opencode",
+                model="mimo-v2.5",
+                protocol="chat_completions",
+            ),
+            "other": ModelMapping(
+                logical_name="other",
+                adapter="opencode",
+                model="muse-spark-1.3-contributor-free",
+                protocol="responses",
+            ),
+        }
+    )
+    chat = config.build_adapter("review")
+    responses = config.build_adapter("other")
+    assert chat.protocol == "chat_completions"
+    assert responses.protocol == "responses"
+    # gateway identity identical; routes differ
+    assert chat.GATEWAY == responses.GATEWAY == "opencode"
 
 
 def test_missing_zen_credential_reported(monkeypatch):
@@ -309,21 +463,25 @@ def test_recorded_call_through_zen_gateway(tmp_path):
     config = ModelConfig(
         models={
             "review": ModelMapping(
-                logical_name="review", adapter="opencode", model="mimo-v2.5", protocol="responses"
+                logical_name="review",
+                adapter="opencode",
+                model="mimo-v2.5",
+                protocol="chat_completions",
             ),
             "deep-review": ModelMapping(
                 logical_name="deep-review",
                 adapter="opencode",
                 model="mimo-v2.5",
-                protocol="responses",
+                protocol="chat_completions",
             ),
         }
     )
     mapping = config.resolve_chamber("deep-review")
     adapter = OpenCodeCognitionAdapter(
         model=mapping.model,
+        protocol=mapping.protocol or "chat_completions",
         api_key="zen-test-key",
-        http_post=lambda *a: responses_fixture(input_tokens=100, output_tokens=50),
+        http_post=lambda *a: chat_fixture(prompt_tokens=100, completion_tokens=50),
     )
     recorded = runtime.invoke_recorded_call(make_spec(), adapter=adapter, model_config=config)
     assert recorded.chamber == "deep-review"
@@ -332,11 +490,11 @@ def test_recorded_call_through_zen_gateway(tmp_path):
     assert recorded.manifest.resolved_model_id == "mimo-v2.5"
     attempt = recorded.attempts[0]
     assert attempt.provider == "opencode"  # gateway, not "openai"
-    assert attempt.protocol == "responses"
+    assert attempt.protocol == "chat_completions"
     assert attempt.raw_observation_kind == "decoded_json"
     assert attempt.raw_artifact is not None
     raw = json.loads(runtime.artifact_store.read_text(attempt.raw_artifact.artifact_id))
-    assert raw["provider_response"]["id"] == "resp-123"
+    assert raw["provider_response"]["id"] == "chatcmpl-zen-1"
     assert raw["output_text"] == FIXTURE_TEXT
     assert "zen-test-key" not in json.dumps(raw)
     assert (attempt.usage.input_tokens, attempt.usage.output_tokens) == (100, 50)
@@ -346,7 +504,7 @@ def test_recorded_call_through_zen_gateway(tmp_path):
     fetched = runtime.get_recorded_call(recorded.call_id)
     assert fetched is not None
     assert fetched.attempts[0].provider == "opencode"
-    assert fetched.attempts[0].protocol == "responses"
+    assert fetched.attempts[0].protocol == "chat_completions"
 
 
 def test_recorded_gateway_failure_is_attempt_not_task_completion(tmp_path):

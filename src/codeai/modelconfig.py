@@ -112,10 +112,12 @@ def load_model_config(path: str | Path | None = None) -> ModelConfig:
 EXAMPLE_CONFIG = """\
 # Logical model names for experiments. No secrets here: keys come from env.
 # OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENAI_COMPAT_API_KEY, OPENCODE_ZEN_API_KEY
+# Protocol is part of the resolved model route through the OpenCode gateway,
+# not a gateway-wide default: mimo-v2.5 is served on chat_completions.
 [models.deep-review]
 adapter = "opencode"
 model = "mimo-v2.5"
-protocol = "responses"
+protocol = "chat_completions"
 
 [models.qwen]
 adapter = "openai-compatible"

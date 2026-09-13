@@ -538,14 +538,46 @@ def _classify_opencode_error(exc: ProviderError) -> str:
     return "provider_error"
 
 
+# Concrete routes through the OpenCode gateway. Protocol is a property of the
+# resolved model route, not of the gateway: e.g. mimo-v2.5 is served on Chat
+# Completions, while other occupants use Responses or Messages.
+OPENCODE_ENDPOINTS = {
+    "responses": "/v1/responses",
+    "chat_completions": "/v1/chat/completions",
+}
+
+
+def _chat_text(parsed: dict[str, Any]) -> str:
+    """Extract canonical text from a Chat-Completions payload.
+
+    Raises ProviderError on malformed output (never silently empty).
+    """
+    choices = parsed.get("choices", [])
+    if not choices or not isinstance(choices[0], dict):
+        raise ProviderError("OpenCode Chat Completions payload contained no choices")
+    message = choices[0].get("message", {})
+    if not isinstance(message, dict):
+        raise ProviderError("OpenCode Chat Completions payload contained no message")
+    content = message.get("content", "")
+    if isinstance(content, list):  # structured content parts
+        text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        if not text:
+            raise ProviderError("OpenCode Chat Completions payload contained no output text")
+        return text
+    if not content:
+        raise ProviderError("OpenCode Chat Completions payload contained no output text")
+    return str(content)
+
+
 @dataclass
 class OpenCodeCognitionAdapter(CognitionAdapter):
     """OpenCode Zen gateway as a first-class cognition adapter.
 
     Gateway identity is always ``opencode``; the wire dialect is carried
-    separately in ``protocol`` (initially ``responses`` only). An
-    OpenAI-compatible endpoint on this gateway must NOT be recorded as
-    provider ``openai``.
+    separately in ``protocol`` (``responses`` or ``chat_completions``) and
+    comes from the resolved model route — it is never inferred from the
+    model name. An OpenAI-compatible endpoint on this gateway must NOT be
+    recorded as provider ``openai``.
 
     Credentials come from ``OPENCODE_ZEN_API_KEY`` (or an explicit api_key)
     only. ``OPENAI_API_KEY`` is never consulted here.
@@ -560,13 +592,18 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
     timeout: float = 120.0
     http_post: Callable[..., dict[str, Any]] | None = None
     user_agent: str = "codeai/0.1.0"
+    # Go-gateway routing token sent as x-opencode-session. Explicit when set;
+    # otherwise generated per invoke and recorded on the attempt (transport
+    # routing, not a secret and not a generation control).
+    session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.api_key is None:
             self.api_key = os.getenv(OPENCODE_ZEN_API_KEY_ENV)
-        if self.protocol != "responses":
+        if self.protocol not in OPENCODE_ENDPOINTS:
+            supported = sorted(OPENCODE_ENDPOINTS)
             raise ValueError(
-                f"unsupported OpenCode protocol '{self.protocol}'; currently supported: 'responses'"
+                f"unsupported OpenCode protocol '{self.protocol}'; currently supported: {supported}"
             )
 
     def _require_key(self) -> str:
@@ -576,14 +613,68 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
             )
         return self.api_key
 
+    def _endpoint(self) -> str:
+        return OPENCODE_ENDPOINTS[self.protocol]
+
+    def _resolve_session(self) -> str:
+        if self.session_id:
+            return self.session_id
+        import uuid as _uuid
+
+        return f"codeai-{_uuid.uuid4().hex[:16]}"
+
+    def _request_body(self, spec: CallSpec) -> dict[str, Any]:
+        """Build the protocol-specific request body for the resolved route."""
+        if self.protocol == "chat_completions":
+            body: dict[str, Any] = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": _opencode_input_text(spec)}],
+            }
+            # Chat route controls: only what this dialect supports. A
+            # Responses-style reasoning.effort is never sent here.
+            max_tokens = _params(spec, "max_tokens", _params(spec, "max_output_tokens"))
+            if max_tokens is not None:
+                try:
+                    body["max_tokens"] = int(max_tokens)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    pass
+            temperature = _params(spec, "temperature")
+            if temperature is not None:
+                body["temperature"] = temperature
+            return body
+        body = {"model": self.model, "input": _opencode_input_text(spec)}
+        reasoning_effort = _params(spec, "reasoning_effort")
+        if reasoning_effort is not None:
+            body["reasoning"] = {"effort": reasoning_effort}
+        max_output = _params(spec, "max_output_tokens", _params(spec, "max_tokens"))
+        if max_output is not None:
+            try:
+                body["max_output_tokens"] = int(max_output)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        temperature = _params(spec, "temperature")
+        if temperature is not None:
+            body["temperature"] = temperature
+        return body
+
     def effective_request(self, spec: CallSpec) -> dict[str, Any]:
-        """Sanitized actually-sent controls for the Responses body (no secrets)."""
+        """Sanitized actually-sent controls for the resolved route (no secrets)."""
         effective: dict[str, Any] = {
             "gateway": self.GATEWAY,
             "protocol": self.protocol,
-            "endpoint": "/v1/responses",
+            "endpoint": self._endpoint(),
             "model": self.model,
         }
+        if self.session_id:
+            effective["session_id"] = self.session_id
+        if self.protocol == "chat_completions":
+            max_tokens = _params(spec, "max_tokens", _params(spec, "max_output_tokens"))
+            if max_tokens is not None:
+                effective["max_tokens"] = max_tokens
+            temperature = _params(spec, "temperature")
+            if temperature is not None:
+                effective["temperature"] = temperature
+            return sanitize_effective_params(effective)
         reasoning_effort = _params(spec, "reasoning_effort")
         if reasoning_effort is not None:
             effective["reasoning_effort"] = reasoning_effort
@@ -602,37 +693,35 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
             key = self._require_key()
             if not self.base_url:
                 raise ProviderError("OpenCode base_url is required")
-            body: dict[str, Any] = {"model": self.model, "input": _opencode_input_text(spec)}
-            reasoning_effort = _params(spec, "reasoning_effort")
-            if reasoning_effort is not None:
-                body["reasoning"] = {"effort": reasoning_effort}
-            max_output = _params(spec, "max_output_tokens", _params(spec, "max_tokens"))
-            if max_output is not None:
-                try:
-                    body["max_output_tokens"] = int(max_output)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    pass
-            temperature = _params(spec, "temperature")
-            if temperature is not None:
-                body["temperature"] = temperature
+            body = self._request_body(spec)
             post = self.http_post or _post_json_with_status
+            session_id = self._resolve_session()
             parsed = post(
-                f"{self.base_url.rstrip('/')}/v1/responses",
+                f"{self.base_url.rstrip('/')}{self._endpoint()}",
                 body,
                 {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {key}",
                     "User-Agent": self.user_agent,
+                    "x-opencode-session": session_id,
                 },
                 self.timeout,
             )
-            text = _responses_text(parsed)
-            raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
-            in_tokens, in_reported = _extract_usage(raw_usage, "input_tokens")
-            out_tokens, out_reported = _extract_usage(raw_usage, "output_tokens")
+            if self.protocol == "chat_completions":
+                text = _chat_text(parsed)
+                raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
+                in_tokens, in_reported = _extract_usage(raw_usage, "prompt_tokens")
+                out_tokens, out_reported = _extract_usage(raw_usage, "completion_tokens")
+            else:
+                text = _responses_text(parsed)
+                raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
+                in_tokens, in_reported = _extract_usage(raw_usage, "input_tokens")
+                out_tokens, out_reported = _extract_usage(raw_usage, "output_tokens")
             usage_source = "measured" if (in_reported or out_reported) else "unavailable"
             cost = estimate_cost_usd(self.model, in_tokens, out_tokens)
             reported_model = parsed.get("model")
+            effective = self.effective_request(spec)
+            effective["session_id"] = session_id  # actual routing token used
             return CallResult(
                 call_id=spec.call_id,
                 raw_output=text,
@@ -651,7 +740,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 pricing_version=PRICING_VERSION,
                 cost_source="estimated" if cost is not None else "unknown",
                 normalizer_version=NORMALIZER_VERSION,
-                effective_parameters=self.effective_request(spec),
+                effective_parameters=effective,
                 protocol=self.protocol,
                 raw_observation_kind="decoded_json",
                 raw_payload=_scrub_payload(parsed),
