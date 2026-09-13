@@ -311,6 +311,19 @@ class CallManifest:
     prompt_hash: str | None = None
     requested_parameters: Mapping[str, Any] = field(default_factory=dict)
     effective_parameters: Mapping[str, Any] = field(default_factory=dict)
+    # Request-plan provenance (Stage 11.5c, additive; historically unavailable
+    # means unavailable, never an asserted empty fact):
+    # - requested_controls: logical declared-control view (parameters over variant).
+    # - omitted_unsupported: declared controls the route does not send.
+    # - defaulted_parameters: values CodeAI itself supplied.
+    # - request_plan_version: preparation contract identifier.
+    # - request_body_sha256: identity of the exact body to be sent (content
+    #   itself is not duplicated; prompt provenance stays with the context).
+    requested_controls: Mapping[str, Any] = field(default_factory=dict)
+    omitted_unsupported: tuple[str, ...] = ()
+    defaulted_parameters: Mapping[str, Any] = field(default_factory=dict)
+    request_plan_version: str | None = None
+    request_body_sha256: str | None = None
     created_at: str | None = None
 
 

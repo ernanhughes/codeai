@@ -24,6 +24,7 @@ from .adapters import (
     CheckVerdict,
     CognitionAdapter,
     ExecutionAdapter,
+    PreparedCognitionRequest,
     VerificationAdapter,
     sanitize_effective_params,
 )
@@ -384,6 +385,13 @@ class Runtime:
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        # Prepare once: adapters exposing prepare()/send() produce a single
+        # prepared request that is both recorded (manifest) and sent (every
+        # attempt). Unknown/invalid controls raise here, before any event or
+        # provider effect. Adapters without this capability use the legacy
+        # invoke path unchanged.
+        prepare = getattr(adapter, "prepare", None)
+        prepared = prepare(spec) if callable(prepare) else None
         request_event = Event.create(
             stream_id=spec.call_id,
             kind="call.requested",
@@ -393,7 +401,10 @@ class Runtime:
         )
         self.ledger.append(request_event)
 
-        manifest = self._build_manifest(spec, adapter=adapter, model_config=model_config)
+        if prepared is not None:
+            manifest = self._build_manifest_from_prepared(spec, prepared)
+        else:
+            manifest = self._build_manifest(spec, adapter=adapter, model_config=model_config)
         self.ledger.append(
             Event.create(
                 stream_id=spec.call_id,
@@ -431,7 +442,10 @@ class Runtime:
                 )
             )
             try:
-                observed = adapter.invoke(spec)
+                if prepared is not None:
+                    observed = adapter.send(prepared)
+                else:
+                    observed = adapter.invoke(spec)
             except RuntimeError as exc:
                 observed = CallResult(
                     call_id=spec.call_id,
@@ -621,6 +635,43 @@ class Runtime:
             prompt_hash=prompt_hash,
             requested_parameters=requested_parameters,
             effective_parameters=effective,
+            created_at=now_utc(),
+        )
+
+    def _build_manifest_from_prepared(
+        self, spec: CallSpec, prepared: PreparedCognitionRequest
+    ) -> CallManifest:
+        """Build the call manifest from the single prepared request.
+
+        The manifest records the exact effective controls, routing, omission
+        record, and body identity of the object that will actually be sent —
+        not a reconstruction. Requested parameters keep the raw caller map
+        (sanitized); requested_controls is the declared logical view.
+        """
+        chamber = spec.chamber
+        logical = spec.logical_model or chamber
+        prompt_hash = hashlib.sha256(
+            f"{spec.instruction}\0{spec.context.prompt}".encode()
+        ).hexdigest()
+        return CallManifest(
+            call_id=spec.call_id,
+            task_id=spec.task_id,
+            chamber=chamber,
+            requested_model=logical or spec.actor.model,
+            provider=prepared.gateway,
+            resolved_model_id=prepared.model,
+            provider_revision=None,
+            revision_source=None,
+            pricing_version=PRICING_VERSION,
+            context_package_id=spec.context.package_id,
+            prompt_hash=prompt_hash,
+            requested_parameters=sanitize_effective_params(dict(spec.parameters)),
+            effective_parameters=_jsonable_mapping(prepared.recorded_effective()),
+            requested_controls=dict(prepared.requested_controls),
+            omitted_unsupported=tuple(prepared.omitted_unsupported),
+            defaulted_parameters=dict(prepared.defaulted_controls),
+            request_plan_version=prepared.plan_version,
+            request_body_sha256=prepared.body_sha256,
             created_at=now_utc(),
         )
 
@@ -2100,6 +2151,11 @@ def _manifest_payload(manifest: CallManifest) -> dict[str, Any]:
         "prompt_hash": manifest.prompt_hash,
         "requested_parameters": _jsonable_mapping(manifest.requested_parameters),
         "effective_parameters": _jsonable_mapping(manifest.effective_parameters),
+        "requested_controls": _jsonable_mapping(manifest.requested_controls),
+        "omitted_unsupported": list(manifest.omitted_unsupported),
+        "defaulted_parameters": _jsonable_mapping(manifest.defaulted_parameters),
+        "request_plan_version": manifest.request_plan_version,
+        "request_body_sha256": manifest.request_body_sha256,
         "created_at": manifest.created_at,
     }
 
@@ -2107,6 +2163,9 @@ def _manifest_payload(manifest: CallManifest) -> dict[str, Any]:
 def _manifest_from_payload(payload: dict[str, Any]) -> CallManifest:
     requested = payload.get("requested_parameters")
     effective = payload.get("effective_parameters")
+    requested_controls = payload.get("requested_controls")
+    defaulted = payload.get("defaulted_parameters")
+    omitted = payload.get("omitted_unsupported")
     return CallManifest(
         call_id=str(payload["call_id"]),
         task_id=str(payload["task_id"]),
@@ -2121,6 +2180,11 @@ def _manifest_from_payload(payload: dict[str, Any]) -> CallManifest:
         prompt_hash=payload.get("prompt_hash"),
         requested_parameters=dict(requested) if isinstance(requested, dict) else {},
         effective_parameters=dict(effective) if isinstance(effective, dict) else {},
+        requested_controls=dict(requested_controls) if isinstance(requested_controls, dict) else {},
+        omitted_unsupported=tuple(omitted) if isinstance(omitted, list) else (),
+        defaulted_parameters=dict(defaulted) if isinstance(defaulted, dict) else {},
+        request_plan_version=payload.get("request_plan_version"),
+        request_body_sha256=payload.get("request_body_sha256"),
         created_at=payload.get("created_at"),
     )
 

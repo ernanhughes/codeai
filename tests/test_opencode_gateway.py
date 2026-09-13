@@ -211,14 +211,16 @@ def test_chat_malformed_and_empty_are_failures():
 
 def test_chat_effective_request_has_no_reasoning_effort():
     adapter = chat_adapter()
-    effective = adapter.effective_request(
+    prepared = adapter.prepare(
         make_spec(parameters={"reasoning_effort": "low", "max_tokens": 512})
     )
+    effective = prepared.recorded_effective()
     assert effective["gateway"] == "opencode"
     assert effective["protocol"] == "chat_completions"
     assert effective["endpoint"] == "/v1/chat/completions"
     assert effective["max_tokens"] == 512
     assert "reasoning_effort" not in effective
+    assert "reasoning" not in prepared.body
     assert "Authorization" not in json.dumps(effective)
 
 
@@ -368,16 +370,19 @@ def test_transport_failure_is_provider_error_not_text():
 
 def test_effective_request_answers_protocol_questions():
     adapter = OpenCodeCognitionAdapter(model="mimo-v2.5", api_key="k")
-    effective = adapter.effective_request(
+    prepared = adapter.prepare(
         make_spec(parameters={"reasoning_effort": "low", "max_tokens": 512})
     )
+    effective = prepared.recorded_effective()
     assert effective["gateway"] == "opencode"
     assert effective["protocol"] == "responses"
     assert effective["model"] == "mimo-v2.5"
-    assert effective["reasoning_effort"] == "low"
+    # wire-faithful: nested provider structure preserved, not flattened
+    assert effective["reasoning"] == {"effort": "low"}
     assert effective["max_output_tokens"] == 512
     assert "temperature" not in effective  # not requested -> not sent
     assert "Authorization" not in json.dumps(effective)
+    assert prepared.body["reasoning"] == {"effort": "low"}
 
 
 # --- model config ------------------------------------------------------------------

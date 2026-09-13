@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 import urllib.request
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .adapters import (
     NORMALIZER_VERSION,
     CallResult,
     CognitionAdapter,
+    InvalidControlError,
+    PreparedCognitionRequest,
     TransportObservation,
     TransportOutcome,
+    UnknownControlError,
     is_credential_key,
     sanitize_effective_params,
 )
@@ -653,6 +657,57 @@ OPENCODE_ENDPOINTS = {
     "chat_completions": "/v1/chat/completions",
 }
 
+# Request-preparation contract identifier. Persisted on new manifests; the
+# contract (declared controls, wire mapping, omission rules) is versioned,
+# never silently extended.
+OPENCODE_REQUEST_PLAN = "opencode-request-plan-v1"
+
+# Declared semantic controls per OpenCode dialect. This single declaration
+# drives validation, wire mapping, omission recording, and effective
+# projection — there is intentionally no second list to drift.
+# Kinds: "direct" (same wire key), "alias" (alternate logical name for the
+# wire key), "nested" (wire path tuple), "unsupported" (accepted, never sent).
+_OPENCODE_CONTROLS: dict[str, dict[str, dict[str, object]]] = {
+    "responses": {
+        "temperature": {"kind": "direct"},
+        "max_output_tokens": {"kind": "direct", "coerce": "int"},
+        "max_tokens": {"kind": "alias", "target": "max_output_tokens", "coerce": "int"},
+        "reasoning_effort": {"kind": "nested", "path": ("reasoning", "effort")},
+        "seed": {"kind": "unsupported"},
+    },
+    "chat_completions": {
+        "temperature": {"kind": "direct"},
+        "max_tokens": {"kind": "direct", "coerce": "int"},
+        "max_output_tokens": {"kind": "alias", "target": "max_tokens", "coerce": "int"},
+        "reasoning_effort": {"kind": "unsupported"},
+        "seed": {"kind": "unsupported"},
+    },
+}
+
+
+def _validate_control(name: str, value: Any) -> Any:
+    """Validate a declared control value; return the wire-ready value.
+
+    Only sent controls are validated. Rejects bools-posing-as-numbers and
+    non-numeric limits explicitly instead of silently dropping them.
+    """
+    if name == "temperature":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidControlError(name, "temperature must be a number")
+        return value
+    if name in ("max_tokens", "max_output_tokens"):
+        if isinstance(value, bool):
+            raise InvalidControlError(name, "token limit must be an integer, not a boolean")
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise InvalidControlError(name, "token limit must be int-coercible") from None
+    if name == "reasoning_effort":
+        if not isinstance(value, str) or not value:
+            raise InvalidControlError(name, "reasoning effort must be a non-empty string")
+        return value
+    return value
+
 
 def _chat_text(parsed: dict[str, Any]) -> str:
     """Extract canonical text from a Chat-Completions payload.
@@ -733,88 +788,129 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
         return f"codeai-{_uuid.uuid4().hex[:16]}"
 
     def _request_body(self, spec: CallSpec) -> dict[str, Any]:
-        """Build the protocol-specific request body for the resolved route."""
-        if self.protocol == "chat_completions":
-            body: dict[str, Any] = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": _opencode_input_text(spec)}],
-            }
-            # Chat route controls: only what this dialect supports. A
-            # Responses-style reasoning.effort is never sent here.
-            max_tokens = _params(spec, "max_tokens", _params(spec, "max_output_tokens"))
-            if max_tokens is not None:
-                try:
-                    body["max_tokens"] = int(max_tokens)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    pass
-            temperature = _params(spec, "temperature")
-            if temperature is not None:
-                body["temperature"] = temperature
-            return body
-        body = {"model": self.model, "input": _opencode_input_text(spec)}
-        reasoning_effort = _params(spec, "reasoning_effort")
-        if reasoning_effort is not None:
-            body["reasoning"] = {"effort": reasoning_effort}
-        max_output = _params(spec, "max_output_tokens", _params(spec, "max_tokens"))
-        if max_output is not None:
-            try:
-                body["max_output_tokens"] = int(max_output)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                pass
-        temperature = _params(spec, "temperature")
-        if temperature is not None:
-            body["temperature"] = temperature
-        return body
+        """Legacy entry: build the body via a throwaway preparation.
 
-    def effective_request(self, spec: CallSpec) -> dict[str, Any]:
-        """Sanitized actually-sent controls for the resolved route (no secrets)."""
-        effective: dict[str, Any] = {
-            "gateway": self.GATEWAY,
-            "protocol": self.protocol,
-            "endpoint": self._endpoint(),
+        Retained only for backward-compatible direct callers; execution uses
+        prepare() + send() so the recorded plan and the sent body are one fact.
+        """
+        return dict(self.prepare(spec).body)
+
+    def prepare(self, spec: CallSpec) -> PreparedCognitionRequest:
+        """Prepare the exact provider request once: validate declared controls,
+        reject unknown controls before any provider effect, resolve routing,
+        and build the single body that send() will submit.
+
+        Raises UnknownControlError / InvalidControlError pre-effect.
+        Requested-but-conflicting alias spellings of the same wire control
+        are rejected as ambiguous.
+        """
+        table = _OPENCODE_CONTROLS[self.protocol]
+        unknown = sorted(
+            str(key) for key in dict(spec.parameters) if str(key) not in table
+        )
+        if unknown:
+            # Name only in the diagnostic: an unknown value could be secret.
+            raise UnknownControlError(unknown[0])
+        merged = {name: _params(spec, name) for name in table}
+        requested = {name: value for name, value in merged.items() if value is not None}
+        # Alias conflict: two spellings of one wire control with different values.
+        seen_targets: dict[str, tuple[str, Any]] = {}
+        for name, control in table.items():
+            if control.get("kind") == "direct" and merged.get(name) is not None:
+                seen_targets[str(name)] = (name, merged[name])
+        for name, control in table.items():
+            if control.get("kind") != "alias" or merged.get(name) is None:
+                continue
+            target = str(control["target"])
+            if target in seen_targets and seen_targets[target][1] != merged[name]:
+                raise InvalidControlError(
+                    name,
+                    f"conflicts with {seen_targets[target][0]!r} for the same wire control",
+                )
+            seen_targets.setdefault(target, (name, merged[name]))
+        body: dict[str, Any] = {
             "model": self.model,
+            **(
+                {"messages": [{"role": "user", "content": _opencode_input_text(spec)}]}
+                if self.protocol == "chat_completions"
+                else {"input": _opencode_input_text(spec)}
+            ),
         }
-        if self.session_id:
-            effective["session_id"] = self.session_id
-        if self.protocol == "chat_completions":
-            max_tokens = _params(spec, "max_tokens", _params(spec, "max_output_tokens"))
-            if max_tokens is not None:
-                effective["max_tokens"] = max_tokens
-            temperature = _params(spec, "temperature")
-            if temperature is not None:
-                effective["temperature"] = temperature
-            return sanitize_effective_params(effective)
-        reasoning_effort = _params(spec, "reasoning_effort")
-        if reasoning_effort is not None:
-            effective["reasoning_effort"] = reasoning_effort
-        max_output = _params(spec, "max_output_tokens", _params(spec, "max_tokens"))
-        if max_output is not None:
-            effective["max_output_tokens"] = max_output
-        temperature = _params(spec, "temperature")
-        if temperature is not None:
-            effective["temperature"] = temperature
-        return sanitize_effective_params(effective)
+        effective: dict[str, Any] = {}
+        omitted: list[str] = []
+        for name, control in table.items():
+            value = merged.get(name)
+            if value is None:
+                continue
+            kind = control.get("kind")
+            if kind == "unsupported":
+                omitted.append(name)
+                continue
+            wire_value = _validate_control(name, value)
+            if kind == "direct":
+                body[str(name)] = wire_value
+                effective[str(name)] = wire_value
+            elif kind == "alias":
+                target = str(control["target"])
+                if target in body:
+                    continue  # primary spelling already won; values were equal
+                body[target] = wire_value
+                effective[target] = wire_value
+            elif kind == "nested":
+                path = tuple(control["path"])  # type: ignore[arg-type]
+                node = body
+                for part in path[:-1]:
+                    node = node.setdefault(str(part), {})
+                node[str(path[-1])] = wire_value
+                effective_nested = effective
+                for part in path[:-1]:
+                    effective_nested = effective_nested.setdefault(str(part), {})
+                effective_nested[str(path[-1])] = wire_value
+        session_id = self._resolve_session()
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return PreparedCognitionRequest(
+            gateway=self.GATEWAY,
+            protocol=self.protocol,
+            endpoint=self._endpoint(),
+            model=self.model,
+            body=body,
+            requested_controls=requested,
+            effective_controls=effective,
+            omitted_unsupported=tuple(sorted(omitted)),
+            defaulted_controls={},
+            routing={"session_id": session_id},
+            public_headers={
+                "User-Agent": self.user_agent,
+                "x-opencode-session": session_id,
+            },
+            body_sha256=hashlib.sha256(canonical).hexdigest(),
+            plan_version=OPENCODE_REQUEST_PLAN,
+        )
 
-    def invoke(self, spec: CallSpec) -> CallResult:
+    def send(self, prepared: PreparedCognitionRequest) -> CallResult:
+        """Submit a prepared request; never rebuild the body.
+
+        Credentials are applied structurally at transport time and never
+        enter the prepared (persisted) representation.
+        """
         started = time.perf_counter()
         started_at = _now_iso()
         transport: TransportObservation | None = None
+        call_id = ""
         try:
             key = self._require_key()
             if not self.base_url:
                 raise ProviderError("OpenCode base_url is required")
-            body = self._request_body(spec)
-            session_id = self._resolve_session()
             post = self.http_post or _request_bytes
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+                **{str(k): str(v) for k, v in prepared.public_headers.items()},
+            }
             reply = post(
-                f"{self.base_url.rstrip('/')}{self._endpoint()}",
-                body,
-                {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {key}",
-                    "User-Agent": self.user_agent,
-                    "x-opencode-session": session_id,
-                },
+                f"{self.base_url.rstrip('/')}{prepared.endpoint}",
+                dict(prepared.body),
+                headers,
                 self.timeout,
             )
             if isinstance(reply, HttpResponse):
@@ -828,7 +924,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                     body=reply.body,
                     headers=dict(reply.headers),
                     content_type=reply.content_type,
-                    endpoint=self._endpoint(),
+                    endpoint=prepared.endpoint,
                     observed_at=_now_iso(),
                 )
                 parsed = _parse_http_response(reply)
@@ -848,10 +944,8 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
             usage_source = "measured" if (in_reported or out_reported) else "unavailable"
             cost = estimate_cost_usd(self.model, in_tokens, out_tokens)
             reported_model = parsed.get("model")
-            effective = self.effective_request(spec)
-            effective["session_id"] = session_id  # actual routing token used
             return CallResult(
-                call_id=spec.call_id,
+                call_id=call_id,
                 raw_output=text,
                 input_tokens=in_tokens,
                 output_tokens=out_tokens,
@@ -868,7 +962,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 pricing_version=PRICING_VERSION,
                 cost_source="estimated" if cost is not None else "unknown",
                 normalizer_version=NORMALIZER_VERSION,
-                effective_parameters=effective,
+                effective_parameters=prepared.recorded_effective(),
                 protocol=self.protocol,
                 raw_observation_kind="decoded_json",
                 raw_payload=_scrub_payload(parsed),
@@ -882,12 +976,12 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                     body=None,
                     headers={},
                     content_type=None,
-                    endpoint=self._endpoint(),
+                    endpoint=prepared.endpoint,
                     exception_type=exc.exception_type,
                     observed_at=_now_iso(),
                 )
             return CallResult(
-                call_id=spec.call_id,
+                call_id=call_id,
                 raw_output="",
                 input_tokens=None,
                 output_tokens=None,
@@ -896,7 +990,7 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 pricing_version=PRICING_VERSION,
                 cost_source="unknown",
                 normalizer_version=NORMALIZER_VERSION,
-                effective_parameters=self.effective_request(spec),
+                effective_parameters=prepared.recorded_effective(),
                 protocol=self.protocol,
                 raw_observation_kind="decoded_json",
                 transport=transport,
@@ -908,6 +1002,10 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 completed_at=_now_iso(),
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
+
+    def invoke(self, spec: CallSpec) -> CallResult:
+        """Legacy entry: prepare once, then send the prepared request."""
+        return replace(self.send(self.prepare(spec)), call_id=spec.call_id)
 
 
 def _now_iso() -> str:

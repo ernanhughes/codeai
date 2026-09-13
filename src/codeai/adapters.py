@@ -152,6 +152,86 @@ class CognitionAdapter(Protocol):
     def invoke(self, spec: CallSpec) -> CallResult: ...
 
 
+class RequestPlanError(ValueError):
+    """A cognition request cannot be prepared exactly as specified.
+
+    Raised before any provider effect. Carries the offending control name,
+    never a secret value.
+    """
+
+
+class UnknownControlError(RequestPlanError):
+    """Caller supplied a control the codec does not declare. Reject, don't guess."""
+
+    def __init__(self, control: str) -> None:
+        super().__init__(
+            f"unknown cognition control: {control!r}; "
+            "only codec-declared controls may affect a provider request"
+        )
+        self.control = control
+
+
+class InvalidControlError(RequestPlanError):
+    """A declared control carries a value the codec cannot place on the wire."""
+
+    def __init__(self, control: str, reason: str) -> None:
+        super().__init__(f"invalid value for cognition control {control!r}: {reason}")
+        self.control = control
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCognitionRequest:
+    """One prepared provider request: the single fact that is both recorded
+    and sent. The outbound HTTP body is produced from this representation,
+    never rebuilt independently.
+
+    - requested_controls: logical control names -> merged caller values
+      (spec.parameters over variant), including known-but-unsupported ones.
+    - effective_controls: wire-shaped controls actually present in the body.
+    - omitted_unsupported: declared controls the route does not send.
+    - defaulted_controls: values CodeAI itself supplied (provider omissions
+      are not invented here).
+    - routing: public non-secret routing metadata (e.g. session id).
+    - public_headers: exact non-secret headers to send (credentials are
+      applied structurally by transport and never appear here).
+    - body: the exact JSON body to submit. Persisted only as body_sha256;
+      prompt content stays referenced via context provenance, not duplicated.
+    """
+
+    gateway: str
+    protocol: str
+    endpoint: str
+    model: str
+    body: Mapping[str, object] = field(default_factory=dict)
+    requested_controls: Mapping[str, object] = field(default_factory=dict)
+    effective_controls: Mapping[str, object] = field(default_factory=dict)
+    omitted_unsupported: tuple[str, ...] = ()
+    defaulted_controls: Mapping[str, object] = field(default_factory=dict)
+    routing: Mapping[str, object] = field(default_factory=dict)
+    public_headers: Mapping[str, str] = field(default_factory=dict)
+    body_sha256: str | None = None
+    plan_version: str = ""
+
+    def recorded_effective(self) -> dict[str, object]:
+        """Durable effective view: route identity plus the wire controls.
+
+        Single definition used both for persistence (manifest/attempt) and
+        for the result returned by send(), so recorded and sent provenance
+        cannot drift apart.
+        """
+        effective: dict[str, object] = {
+            "gateway": self.gateway,
+            "protocol": self.protocol,
+            "endpoint": self.endpoint,
+            "model": self.model,
+        }
+        session_id = self.routing.get("session_id")
+        if session_id is not None:
+            effective["session_id"] = session_id
+        effective.update(dict(self.effective_controls))
+        return effective
+
+
 class ActionStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
