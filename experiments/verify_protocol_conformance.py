@@ -37,6 +37,11 @@ def verify(root):
         interpretations = {e['payload']['interpretation_id'] for e in events
                            if e['kind'] == 'attempt.interpreted'}
         assert interpretations
+        for event in events:
+            if event['kind'] == 'attempt.retry_decided':
+                assert event['payload']['interpretation_id'] in interpretations
+            if event['kind'] == 'call.status_decided':
+                assert set(event['payload']['interpretation_ids']) <= interpretations
         assert 'task.completed' not in kinds
     print(f'PASS: {len(inventory)} file hashes and recorded event chains in {root}')
 
