@@ -704,14 +704,13 @@ class Runtime:
     def _check_replay_fingerprint(self, spec: CallSpec, original: RecordedCall) -> None:
         """Reject same-key, materially-different requests before any effect."""
         expected = (
-            original.task_id,
             original.manifest.prompt_hash,
             original.manifest.chamber,
             original.manifest.requested_model,
         )
         actual = _request_fingerprint(spec)
         if actual != expected:
-            dimensions = ("task_id", "prompt_hash", "chamber", "requested_model")
+            dimensions = ("prompt_hash", "chamber", "requested_model")
             mismatched = sorted(
                 dimension
                 for dimension, want, got in zip(dimensions, expected, actual)
@@ -1465,6 +1464,12 @@ class Runtime:
         invisible via lineage-aware seals; raw results persist independently;
         one branch failing never erases successful siblings; no synthesis.
         Works for same-model x N and heterogeneous-models x N alike.
+
+        Stochastic branches execute through invoke_recorded_call, so each
+        gains manifest, prepared-request provenance, attempt, transport
+        observation, interpretation, and decision evidence. The return
+        contract stays tuple[CallResult, ...]: replayed branches carry
+        replayed=True and the original outcome, never a new status.
         """
         import uuid as _uuid
 
@@ -1548,7 +1553,18 @@ class Runtime:
                 arm=str(branch.get("arm", arm)) if branch.get("arm", arm) is not None else None,
             )
             try:
-                result = self.invoke_call(spec, adapter=adapter)
+                raw_attempts = branch.get("max_attempts", 1)
+                if (
+                    isinstance(raw_attempts, bool)
+                    or not isinstance(raw_attempts, int)
+                    or raw_attempts < 1
+                ):
+                    raise ValueError(f"invalid max_attempts: {raw_attempts!r}")
+                _, result, _ = self._invoke_recorded_call_detailed(
+                    spec,
+                    adapter=adapter,
+                    max_attempts=raw_attempts,
+                )
             except (ValueError, RuntimeError) as exc:  # never let one branch kill siblings
                 result = CallResult(call_id=call_id, raw_output="", status="failed", error=str(exc))
                 self.ledger.append(
@@ -2079,13 +2095,18 @@ def _prompt_hash_for_spec(spec: CallSpec) -> str:
 
 
 def _request_fingerprint(spec: CallSpec) -> tuple[Any, ...]:
-    """Logical request identity for idempotency matching: task, prompt bytes,
-    chamber, and requested logical model. Resolved occupants are deliberately
-    excluded: re-resolution under the same key replays the original effect."""
+    """Logical request identity for idempotency matching: prompt bytes,
+    chamber, and requested logical model.
+
+    Task identity is deliberately excluded: reruns legitimately create new
+    tasks for the same logical operation (run_arm mints a task per run), and
+    the idempotency key remains authoritative for operation identity.
+    Resolved occupants are excluded: re-resolution under the same key
+    replays the original effect.
+    """
     chamber = spec.chamber
     logical = spec.logical_model or chamber
     return (
-        spec.task_id,
         _prompt_hash_for_spec(spec),
         chamber,
         logical or spec.actor.model,

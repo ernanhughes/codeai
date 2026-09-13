@@ -623,8 +623,17 @@ def run_arm(
             adapter = model_config.build_adapter(logical)
             stance = stances[i % len(stances)]
             stance_counts[stance] = stance_counts.get(stance, 0) + 1
+            # Stable branch identity: rerunning the same experiment arm over
+            # the same corpus task replays completed branches (zero new
+            # provider effects) instead of duplicating samples. The index
+            # keeps same-model samples distinct within one run.
+            branch_call_id = f"{experiment_id}.{arm_name}.{corpus_task.task_id}.{i}"
             branches.append(
                 {
+                    "call_id": branch_call_id,
+                    "idempotency_key": (
+                        f"fanout:{experiment_id}:{arm_name}:{corpus_task.task_id}:{i}"
+                    ),
                     "actor": ActorRef(actor_id=f"{actor_prefix}-{logical}-{i}", kind="model",
                                       provider=mapping.adapter, model=mapping.model),
                     "adapter": adapter,
@@ -663,6 +672,11 @@ def run_arm(
             experiment_id=experiment_id, arm=arm_name,
         )
         for result in results:
+            # Replayed branches reuse their original candidate evidence as-is:
+            # re-verifying would duplicate candidate/check/claim events and
+            # inflate sample counts without a new provider effect.
+            if result.replayed:
+                continue
             _verify_candidate(
                 runtime, experiment_id, arm_name, corpus_task, task.task_id,
                 result, candidates_root, verifier, timeout,

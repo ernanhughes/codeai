@@ -264,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  usage_source: {attempt.usage.source.value} cost={attempt.cost_usd}")
             print(f"  effective_parameters: {dict(attempt.effective_parameters)}")
         print(f"call_status: {recorded.status}")
+        print(f"replayed: {recorded.replayed}")
         print("task_status: not automatically completed")
         return 0 if recorded.status == "succeeded" else 1
 
@@ -321,7 +322,8 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run or task.directive_id,
         )
         for result in results:
-            print(f"{result.call_id}: {result.status} model={result.model}")
+            replayed = " replayed" if result.replayed else ""
+            print(f"{result.call_id}: {result.status} model={result.model}{replayed}")
         return 0
 
     if args.command == "claims":
