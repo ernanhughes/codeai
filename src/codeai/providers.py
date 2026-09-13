@@ -761,6 +761,25 @@ def _messages_text(parsed: dict[str, Any]) -> str:
     return text
 
 
+def output_text_for(protocol: str | None, parsed: dict[str, Any]) -> str:
+    """Canonical output text of a decoded response body, or "" if it has none.
+
+    Used when reinterpreting preserved observations: a malformed or text-less
+    body yields "" and the interpreter classifies it, never an exception here.
+    """
+    extract = {
+        "chat_completions": _chat_text,
+        "responses": _responses_text,
+        "messages": _messages_text,
+    }.get(protocol or "")
+    if extract is None:
+        return ""
+    try:
+        return extract(parsed)
+    except ProviderError:
+        return ""
+
+
 @dataclass
 class OpenCodeCognitionAdapter(CognitionAdapter):
     """OpenCode Zen gateway as a first-class cognition adapter.

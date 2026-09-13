@@ -102,6 +102,7 @@ class CallState:
     call_status: str | None = None
     superseded_by: str | None = None
     resumed_as: str | None = None
+    status_basis: str | None = None  # "execution:<policy>" or "reinterpretation:<interpreter>/<policy>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,8 +208,16 @@ def _call_states(events: tuple[Event, ...], task_id: str) -> tuple[CallState, ..
         kinds = {e.kind for e in call_events}
         attempts = sorted((e for e in call_events if e.kind == "attempt.started"),
                           key=lambda e: int(e.payload.get("attempt_index") or 0))
-        status_events = [e for e in call_events if e.kind == "call.status_decided"]
+        status_events = [e for e in call_events if e.kind in ("call.status_decided", "call.reinterpreted")]
         call_status = str(status_events[-1].payload.get("status")) if status_events else None
+        status_basis = None
+        if status_events:
+            latest = status_events[-1].payload
+            status_basis = (
+                f"reinterpretation:{latest.get('interpreter_version')}/{latest.get('policy_version')}"
+                if status_events[-1].kind == "call.reinterpreted"
+                else f"execution:{latest.get('policy_version')}"
+            )
         resumed_as = next((str(e.payload["to_call_id"]) for e in call_events if e.kind == "call.resumed"), None)
         effect = "observed" if attempts else "none"
         risk = False
@@ -267,7 +276,7 @@ def _call_states(events: tuple[Event, ...], task_id: str) -> tuple[CallState, ..
             call_id=call_id, idempotency_key=None if key is None else str(key), stage=stage,
             provider_effect=effect, next_operation=operation.value, duplicate_effect_risk=risk, reason=reason,
             attempt_count=len(attempts), call_status=call_status, superseded_by=superseded_by,
-            resumed_as=resumed_as,
+            resumed_as=resumed_as, status_basis=status_basis,
         ))
     return tuple(states)
 

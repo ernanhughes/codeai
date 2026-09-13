@@ -78,7 +78,7 @@ from .interpretation import (
 )
 from .ledger import Event, SQLiteLedger
 from .policy import AuthorityDenied, PolicyEngine
-from .providers import PRICING_VERSION, estimate_cost_usd
+from .providers import PRICING_VERSION, estimate_cost_usd, output_text_for
 from .rendering import (
     KNOWN_RENDERERS,
     ContextResolutionError,
@@ -1514,6 +1514,228 @@ class Runtime:
                 completed.payload.get("protocol"), parsed, version=version
             ),
         }
+
+    # ------------------------------------------------------------------
+    # Reinterpretation: preserve once, interpret many times (Stage 17)
+    # ------------------------------------------------------------------
+
+    def reinterpret_attempt(
+        self, attempt_id: str, *, interpreter_version: str, actor_id: str = "runtime"
+    ) -> AttemptInterpretation:
+        """Interpret an attempt again from its preserved observation, and record it.
+
+        The only evidence is the ``attempt.observed`` event and the response bytes
+        it names, read with integrity checks. The CodeAI-derived envelope and
+        adapter messages are not observations and are never used. No completion
+        record is needed, so an attempt interrupted after observation can be
+        interpreted. One interpretation is recorded per version: a repeat
+        returns it and appends nothing. Raises ObservationUnavailable, appending
+        nothing, when the observation or its bytes cannot be read. No provider
+        is contacted.
+        """
+        interpretation, _text, observed_event = self._interpret_from_observation(
+            attempt_id, interpreter_version
+        )
+        existing = [
+            item for item in self.interpretations_for_attempt(attempt_id)
+            if item.interpreter_version == interpreter_version
+        ]
+        if existing:
+            return existing[-1]
+        self._append_reinterpretation(interpretation, observed_event, actor_id=actor_id)
+        return interpretation
+
+    def reinterpret_call(
+        self,
+        call_id: str,
+        *,
+        interpreter_version: str,
+        policy_version: str,
+        actor_id: str = "runtime",
+    ) -> dict[str, Any]:
+        """Re-decide a recorded call from its preserved observations under named versions.
+
+        Every attempt is interpreted from its observation, and every decision is
+        derived, before anything is appended. Then missing interpretations and one
+        ``call.reinterpreted`` record are appended: status, reason, per-attempt
+        decisions, the interpretations and observation hashes used, and the status
+        record it supersedes as the adopted view. ``call.status_decided`` and
+        every earlier event are unchanged. A repeat with the same versions returns
+        the existing record. Reinterpretation never starts a new attempt.
+        """
+        recorded = self.get_recorded_call(call_id)
+        if recorded is None or not recorded.attempts:
+            raise ObservationUnavailable(call_id, "no recorded attempts for this call")
+        computed = []
+        for attempt in recorded.attempts:
+            interpretation, text, observed_event = self._interpret_from_observation(
+                attempt.attempt_id, interpreter_version
+            )
+            existing = [
+                item for item in self.interpretations_for_attempt(attempt.attempt_id)
+                if item.interpreter_version == interpreter_version
+            ]
+            decision, reason = decide_attempt(
+                existing[-1] if existing else interpretation,
+                policy_version=policy_version,
+                has_output_text=bool(text),
+            )
+            computed.append((attempt, interpretation, bool(existing), existing, decision, reason,
+                             observed_event))
+        prior = [
+            event for event in self.ledger.events_by_kind(("call.reinterpreted",))
+            if event.stream_id == call_id
+            and event.payload.get("interpreter_version") == interpreter_version
+            and event.payload.get("policy_version") == policy_version
+        ]
+        if prior:
+            return dict(prior[-1].payload)
+        latest = self._latest_status_record(call_id)
+        interpretations: list[AttemptInterpretation] = []
+        decisions: list[AttemptDecision] = []
+        for attempt, interpretation, had, existing, decision, reason, observed_event in computed:
+            if had:
+                interpretation = existing[-1]
+            else:
+                self._append_reinterpretation(interpretation, observed_event, actor_id=actor_id)
+            interpretations.append(interpretation)
+            decisions.append(AttemptDecision(decision=decision, reason=reason, executed=False))
+        status, status_reason = _decide_call_status(list(recorded.attempts), interpretations, decisions)
+        if decisions[-1].decision == "retry":
+            status_reason = "reinterpretation decides retry; reinterpretation never starts an attempt"
+        payload = {
+            "call_id": call_id,
+            "task_id": recorded.task_id,
+            "interpreter_version": interpreter_version,
+            "policy_version": policy_version,
+            "status": status,
+            "reason": status_reason,
+            "interpretation_ids": [item.interpretation_id for item in interpretations],
+            "decisions": [
+                {"attempt_id": attempt.attempt_id, "interpretation_id": item.interpretation_id,
+                 "decision": decided.decision, "reason": decided.reason}
+                for (attempt, *_rest), item, decided in zip(computed, interpretations, decisions)
+            ],
+            "observations": [
+                {"attempt_id": item.attempt_id,
+                 "sha256": item.response_body_artifact.sha256 if item.response_body_artifact else None}
+                for item in interpretations
+            ],
+            "prior_status": latest.payload.get("status") if latest is not None else None,
+            "prior_record_kind": latest.kind if latest is not None else None,
+            "prior_record_event_id": latest.event_id if latest is not None else None,
+            "provider_effect": False,
+        }
+        self.ledger.append(
+            Event.create(
+                stream_id=call_id,
+                kind="call.reinterpreted",
+                actor_id=actor_id,
+                payload=payload,
+                causation_id=latest.event_id if latest is not None else None,
+                correlation_id=recorded.task_id,
+            )
+        )
+        return payload
+
+    def _latest_status_record(self, call_id: str) -> Event | None:
+        records = [
+            event
+            for event in self.ledger.events_by_kind(("call.status_decided", "call.reinterpreted"))
+            if event.stream_id == call_id
+        ]
+        return records[-1] if records else None
+
+    def _interpret_from_observation(
+        self, attempt_id: str, interpreter_version: str
+    ) -> tuple[AttemptInterpretation, str, Event]:
+        observed_event = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("attempt.observed",))
+                if event.stream_id == attempt_id
+                or str(event.payload.get("attempt_id", "")) == attempt_id
+            ),
+            None,
+        )
+        if observed_event is None:
+            raise ObservationUnavailable(
+                attempt_id, "no attempt.observed event: nothing was preserved to interpret"
+            )
+        observed = observed_event.payload
+        ref = observed.get("response_body_artifact")
+        body: bytes | None = None
+        body_artifact: ArtifactRef | None = None
+        if isinstance(ref, dict):
+            if self.artifact_store is None:
+                raise ObservationUnavailable(attempt_id, "no artifact store to read the response body")
+            try:
+                body = self.artifact_store.read_bytes(str(ref["artifact_id"]))
+                body_artifact = ArtifactRef(
+                    artifact_id=str(ref["artifact_id"]),
+                    sha256=str(ref["sha256"]),
+                    media_type=str(ref.get("media_type", "application/octet-stream")),
+                    uri=ref.get("uri"),
+                )
+            except FileNotFoundError as exc:
+                raise ObservationUnavailable(attempt_id, "response body bytes are missing") from exc
+            except ArtifactCorruptionError as exc:
+                raise ObservationUnavailable(
+                    attempt_id, "response body bytes do not match their recorded sha256"
+                ) from exc
+            except KeyError as exc:
+                raise ObservationUnavailable(attempt_id, "response body reference is malformed") from exc
+        protocol = observed.get("protocol")
+        parsed: dict[str, Any] = {}
+        text = ""
+        if body is not None:
+            try:
+                loaded = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                loaded = None
+            if isinstance(loaded, dict):
+                parsed = loaded
+                text = output_text_for(protocol, loaded)
+        http_status = observed.get("http_status")
+        entry = InterpretationInput(
+            attempt_id=attempt_id,
+            call_id=str(observed.get("call_id", "")),
+            task_id=str(observed.get("task_id", "")),
+            protocol=protocol,
+            transport_outcome=observed.get("transport_outcome"),
+            http_status=None if http_status is None else int(http_status),
+            exception_type=observed.get("exception_type"),
+            failure_message=None,
+            body_bytes=body,
+            parsed=parsed,
+            output_text=text,
+            adapter_status="succeeded" if text else "failed",
+            adapter_error_kind=None,
+        )
+        interpretation = interpret_attempt(
+            entry,
+            version=interpreter_version,
+            observation_event_id=observed_event.event_id,
+            response_body_artifact=body_artifact,
+        )
+        return interpretation, text, observed_event
+
+    def _append_reinterpretation(
+        self, interpretation: AttemptInterpretation, observed_event: Event, *, actor_id: str
+    ) -> None:
+        payload = _interpretation_payload(interpretation)
+        payload["evidence_source"] = "attempt.observed"
+        payload["recorded_by"] = "reinterpretation"
+        self.ledger.append(
+            Event.create(
+                stream_id=interpretation.attempt_id,
+                kind="attempt.interpreted",
+                actor_id=actor_id,
+                payload=payload,
+                causation_id=observed_event.event_id,
+                correlation_id=interpretation.task_id,
+            )
+        )
 
     def project_call_as(
         self, call_id: str, *, interpreter_version: str, policy_version: str

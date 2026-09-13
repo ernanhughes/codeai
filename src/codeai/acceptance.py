@@ -244,7 +244,14 @@ def _validate_source(runtime: Runtime, request: AcceptanceRequest) -> list[str]:
     recorded = runtime.get_recorded_call(request.source_call_id)
     if not decided or recorded is None or recorded.call_id != request.source_call_id:
         return ["source_call_not_found"]
-    status = decided[-1]
+    # The adopted status is the latest of the execution-time decision and any
+    # later reinterpretation of the preserved observations (Stage 17).
+    adopted = [
+        event
+        for event in runtime.ledger.events_by_kind(("call.status_decided", "call.reinterpreted"))
+        if event.stream_id == request.source_call_id
+    ]
+    status = adopted[-1]
 
     reasons: list[str] = []
     if recorded.task_id != request.task_id or str(status.payload.get("task_id")) != request.task_id:
@@ -271,7 +278,7 @@ def _validate_source(runtime: Runtime, request: AcceptanceRequest) -> list[str]:
             reasons.append("interpretation_wrong_call")
         if matches[0].generation_state != GenerationState.COMPLETE.value:
             reasons.append("generation_not_complete")
-    if request.actor_id == status.actor_id:
+    if request.actor_id == decided[-1].actor_id:  # the producing actor, not a reinterpreter
         reasons.append("self_acceptance")
     if named is not None:
         output = _preserved_output_text(runtime, named.raw_artifact)
