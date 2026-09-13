@@ -37,7 +37,12 @@ from .adapters import (
     sanitize_effective_params,
 )
 from .artifacts import FileArtifactStore
-from .context import CompilationTrace, ContextCompiler
+from .context import (
+    CompilationTrace,
+    ContextBudgetUnsatisfiable,
+    ContextCompiler,
+    ContextSealViolation,
+)
 from .domain import (
     ActorRef,
     ArtifactRef,
@@ -81,6 +86,8 @@ from .rendering import (
     prepared_input_text,
     render_context,
 )
+from .workstate import WorkState, project_work_state
+from .workstate import resume_call as _resume_call
 
 
 class PreconditionMismatch(RuntimeError):
@@ -320,6 +327,23 @@ class Runtime:
     def task_completion(self, task_id: str) -> TaskCompletion:
         """Project task completion from the ledger without appending."""
         return project_task_completion(self, task_id)
+
+    # ------------------------------------------------------------------
+    # Working state: restart is reopening; resume is knowing what is safe next
+    # ------------------------------------------------------------------
+
+    def work_state(self, task_id: str) -> WorkState:
+        """Project attempted, failed, unresolved and safe-next work; appends nothing."""
+        return project_work_state(self, task_id)
+
+    def resume_call(
+        self, call_id: str, *, adapter: CognitionAdapter, model_config: Any | None = None
+    ) -> RecordedCall:
+        """Continue an interrupted call only where no provider effect is recorded.
+
+        See codeai.workstate. Raises ResumeRefused for every other state.
+        """
+        return _resume_call(self, call_id, adapter=adapter, model_config=model_config)
 
     # ------------------------------------------------------------------
     # Cognition boundary: CallRequest -> CallResult -> artifact -> claims
@@ -1841,10 +1865,77 @@ class Runtime:
         )
         return disagreement_report(claims, relationships)
 
-    def compile_and_record_context(self, *, actor_id: str = "runtime", task_id: str, **kwargs: object) -> tuple[ContextPackage, CompilationTrace]:
+    def compile_and_record_context(
+        self, *, actor_id: str = "runtime", task_id: str, **kwargs: Any
+    ) -> tuple[ContextPackage, CompilationTrace]:
+        """Compile context and record the attempt, its inventory and its outcome.
+
+        ``context.compilation_requested`` (the offered candidate inventory with
+        requirements, sizes and lineage, plus seal, budget and prompt) is
+        appended before compiling; then ``context.compiled`` or
+        ``context.compilation_failed``, causally linked by compilation_id.
+        """
         compiler = ContextCompiler()
-        package, trace = compiler.compile_with_trace(task_id=task_id, **kwargs)  # type: ignore[arg-type]
-        self._append_context_compiled(package, trace, actor_id=actor_id, task_id=task_id)
+        compilation_id = str(uuid.uuid4())
+        for key in ("events", "artifact_ids", "claim_ids", "required_event_ids",
+                    "required_artifact_ids", "required_claim_ids"):
+            if key in kwargs:
+                kwargs[key] = tuple(kwargs[key])  # inventory and compiler see the same inputs
+        offer_keys = ("events", "artifact_ids", "claim_ids", "required_event_ids",
+                      "required_artifact_ids", "required_claim_ids", "event_token_sizes",
+                      "claim_lineage", "artifact_lineage")
+        offered = {key: kwargs[key] for key in offer_keys if key in kwargs}
+        candidates = compiler.offered_candidates(**offered)
+        seal = kwargs.get("seal")
+        actor = kwargs.get("actor")
+        requested = Event.create(
+            stream_id=compilation_id,
+            kind="context.compilation_requested",
+            actor_id=actor_id,
+            payload={
+                "compilation_id": compilation_id,
+                "task_id": task_id,
+                "actor": asdict(actor) if actor is not None else None,
+                "prompt": kwargs.get("prompt"),
+                "prompt_version": kwargs.get("prompt_version"),
+                "objective": kwargs.get("objective"),
+                "budget_tokens": kwargs.get("budget_tokens"),
+                "seal": _seal_payload(seal) if seal is not None else None,
+                "candidates": [asdict(candidate) for candidate in candidates],
+                "required_ids": sorted({
+                    str(item)
+                    for key in ("required_event_ids", "required_artifact_ids", "required_claim_ids")
+                    for item in offered.get(key, ())
+                }),
+                "size_basis": ("declared event_token_sizes where given; otherwise estimated from "
+                               "serialized event payload length; artifact and claim candidates count zero"),
+            },
+            correlation_id=task_id,
+        )
+        self.ledger.append(requested)
+        try:
+            package, trace = compiler.compile_with_trace(task_id=task_id, **kwargs)
+        except (ContextSealViolation, ContextBudgetUnsatisfiable) as exc:
+            self.ledger.append(
+                Event.create(
+                    stream_id=compilation_id,
+                    kind="context.compilation_failed",
+                    actor_id=actor_id,
+                    payload={
+                        "compilation_id": compilation_id,
+                        "task_id": task_id,
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                    causation_id=requested.event_id,
+                    correlation_id=task_id,
+                )
+            )
+            raise
+        self._append_context_compiled(
+            package, trace, actor_id=actor_id, task_id=task_id,
+            compilation_id=compilation_id, causation_id=requested.event_id,
+        )
         return package, trace
 
     def decide_next(self, query: object) -> object:
@@ -2037,7 +2128,14 @@ class Runtime:
         )
 
     def _append_context_compiled(
-        self, package: ContextPackage, trace: CompilationTrace, *, actor_id: str, task_id: str
+        self,
+        package: ContextPackage,
+        trace: CompilationTrace,
+        *,
+        actor_id: str,
+        task_id: str,
+        compilation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         self.ledger.append(
             Event.create(
@@ -2068,7 +2166,9 @@ class Runtime:
                     ],
                     "included_ids": list(trace.included_ids),
                     "excluded_ids": list(trace.excluded_ids),
+                    "compilation_id": compilation_id,
                 },
+                causation_id=causation_id,
                 correlation_id=task_id,
             )
         )
@@ -2486,6 +2586,15 @@ def _jsonable_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         else:
             out[str(key)] = item
     return out
+
+
+def _seal_payload(seal: Seal) -> dict[str, list[str]]:
+    return {
+        "forbidden_event_ids": sorted(seal.forbidden_event_ids),
+        "forbidden_call_ids": sorted(seal.forbidden_call_ids),
+        "forbidden_artifact_ids": sorted(seal.forbidden_artifact_ids),
+        "forbidden_lineage_ids": sorted(seal.forbidden_lineage_ids),
+    }
 
 
 def _manifest_payload(manifest: CallManifest) -> dict[str, Any]:

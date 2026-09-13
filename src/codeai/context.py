@@ -185,6 +185,59 @@ class ContextCompiler:
         required_events = set(required_event_ids)
         required_artifacts = set(required_artifact_ids)
         required_claims = set(required_claim_ids)
+        candidates = self.offered_candidates(
+            events=selected_events,
+            artifact_ids=artifact_ids,
+            claim_ids=claim_ids,
+            required_event_ids=required_events,
+            required_artifact_ids=required_artifacts,
+            required_claim_ids=required_claims,
+            event_token_sizes=event_token_sizes,
+            claim_lineage=claim_lineage,
+            artifact_lineage=artifact_lineage,
+        )
+
+        # Explicit required ids that were never supplied as candidates are missing.
+        supplied_ids = {c.candidate_id for c in candidates}
+        for missing in sorted((required_events | required_artifacts | required_claims) - supplied_ids):
+            raise RequiredContextMissing(f"REQUIRED_CONTEXT_MISSING: {missing} was required but not supplied")
+
+        return self._select(
+            task_id=task_id,
+            actor=actor,
+            prompt=prompt,
+            candidates=candidates,
+            seal=seal,
+            objective=objective,
+            budget_tokens=budget_tokens,
+            prompt_version=prompt_version,
+            metadata=metadata,
+            event_by_id=event_by_id,
+        )
+
+    def offered_candidates(
+        self,
+        *,
+        events: Iterable[Event] = (),
+        artifact_ids: Iterable[str] = (),
+        claim_ids: Iterable[str] = (),
+        required_event_ids: Iterable[str] = (),
+        required_artifact_ids: Iterable[str] = (),
+        required_claim_ids: Iterable[str] = (),
+        event_token_sizes: Mapping[str, int] | None = None,
+        claim_lineage: Mapping[str, Iterable[str]] | None = None,
+        artifact_lineage: Mapping[str, Iterable[str]] | None = None,
+    ) -> list[ContextCandidate]:
+        """The candidate inventory compile_with_trace builds from these inputs.
+
+        Same rules and sizes as compilation (declared event sizes, otherwise
+        estimated; artifact and claim candidates size zero). Exposed so the
+        runtime can record what was offered, not only what was selected.
+        """
+        selected_events = tuple(events)
+        required_events = set(required_event_ids)
+        required_artifacts = set(required_artifact_ids)
+        required_claims = set(required_claim_ids)
         sizes = dict(event_token_sizes or {})
         claim_lineage_map = {k: tuple(v) for k, v in dict(claim_lineage or {}).items()}
         artifact_lineage_map = {k: tuple(v) for k, v in dict(artifact_lineage or {}).items()}
@@ -239,13 +292,24 @@ class ContextCompiler:
                 )
             )
 
-        # Explicit required ids that were never supplied as candidates are missing.
-        supplied_ids = {c.candidate_id for c in candidates}
-        for missing in sorted((required_events | required_artifacts | required_claims) - supplied_ids):
-            raise RequiredContextMissing(f"REQUIRED_CONTEXT_MISSING: {missing} was required but not supplied")
+        return candidates
 
+    def _select(
+        self,
+        *,
+        task_id: str,
+        actor: ActorRef,
+        prompt: str,
+        candidates: list[ContextCandidate],
+        seal: Seal,
+        objective: str | None,
+        budget_tokens: int | None,
+        prompt_version: str | None,
+        metadata: Mapping[str, Any] | None,
+        event_by_id: Mapping[str, Event],
+    ) -> tuple[ContextPackage, CompilationTrace]:
         # Deterministic ordering for replayability.
-        candidates.sort(key=lambda c: (c.kind, c.candidate_id))
+        candidates = sorted(candidates, key=lambda c: (c.kind, c.candidate_id))
 
         entries: list[TraceEntry] = []
         included: list[ContextCandidate] = []
