@@ -11,16 +11,27 @@ from codeai.artifacts import FileArtifactStore
 from codeai.domain import ActorRef
 from codeai.ledger import SQLiteLedger
 from codeai.router_analysis import (
-    auditability, catastrophes, flip_rate, percentile, summarize, verify_ledger,
+    auditability,
+    catastrophes,
+    flip_rate,
+    percentile,
+    summarize,
+    verify_ledger,
 )
 from codeai.router_contract import (
-    CORPUS_VERSION, STATE_FIELDS, RouterCase, adjudicate, deterministic_extract,
-    digest, freeze_manifest, state_from_dict, validate_corpus, write_once,
+    CORPUS_VERSION,
+    RouterCase,
+    adjudicate,
+    deterministic_extract,
+    freeze_manifest,
+    state_from_dict,
+    validate_corpus,
+    write_once,
 )
 from codeai.router_experiment import run
 from codeai.router_model import ModelRouter, parse_output
 from codeai.runtime import Runtime
-from codeai.scheduler import POLICY_VERSION, SchedulerInput, decide_next_step
+from codeai.scheduler import SchedulerInput, decide_next_step
 
 
 @pytest.fixture(autouse=True)
@@ -153,8 +164,13 @@ def fake_with_transport(monkeypatch):
         result = invoke(spec)
         if spec.prompt_version == "router-extract-v1":
             result = replace(result, raw_output=json.dumps({"state": state(), "reason": "done"}))
+        # A coherent fake provider observation: decoded payload AND body bytes must
+        # agree, because the v2 interpreter reads the completion reason from
+        # raw_payload, not from transport bytes. Faking only one side produces an
+        # "unknown" generation state, exactly as a real incomplete observation would.
         body = json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": result.raw_output}}]}).encode()
-        return replace(result, protocol="chat_completions", transport=TransportObservation(
+        return replace(result, protocol="chat_completions", raw_payload=json.loads(body),
+                       transport=TransportObservation(
             outcome="response_received", status_code=200, body=body, content_type="application/json"))
     monkeypatch.setattr(adapter, "invoke", scripted)
     return adapter
@@ -192,9 +208,31 @@ def test_metrics_synthetic():
         "non_contradictory": True, "rater_id": "test"}])["adequate_fraction"] == .5
     assert not auditability([], [])["complete"]
     c = RouterCase("amb", "R1", "budget", state(model_budget_exhausted=True))
-    rows = [dict(case_id="amb", component="R1", path=p, variant="baseline", repeat=0,
-                 operation="CALL", cost_usd=None) for p in ("D", "M-direct")]
+    rows = [{"case_id": "amb", "component": "R1", "path": p, "variant": "baseline",
+             "repeat": 0, "operation": "CALL", "cost_usd": None} for p in ("D", "M-direct")]
     report = summarize(rows, [c], {"amb": "AMBIGUOUS"})
     assert report["components"]["R1"]["M-direct/baseline"]["scorable_cases"] == 0
     assert report["components"]["R1"]["M-direct/baseline"]["catastrophe_count"] == 1
     assert report["verdict"] == "STATE_REPRESENTATION_UNDERDETERMINED"
+
+
+def test_draft_corpus_status():
+    """Draft corpus: schema-valid and correctly sized, but NOT freezable.
+
+    R2/C rows ship review_required until human sufficiency review; freeze must
+    refuse. This test pins that the experiment is unrun and unfreezable.
+    """
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "experiments" / "router_cases_v1.DRAFT.json"
+    corpus = json.loads(path.read_text(encoding="utf-8"))
+    cases = validate_corpus(corpus)
+    by_component = {}
+    for c in cases:
+        by_component.setdefault(c.component, []).append(c)
+    assert len(by_component["R1"]) == 24
+    assert len(by_component["R2"]) == 24
+    assert len(by_component["C"]) == 20
+    assert all(c.semantic_validity == "valid" for c in by_component["R1"])
+    with pytest.raises(ValueError):
+        validate_corpus(corpus, freeze=True)

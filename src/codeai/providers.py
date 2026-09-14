@@ -955,6 +955,15 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
         started_at = _now_iso()
         transport: TransportObservation | None = None
         call_id = ""
+        # Usage is a fact about the response body, independent of whether it
+        # carries output text. Parse it before text extraction so a text-less
+        # 200 (Stage 29B top-first A05: 92 in / 2048 out, empty content) keeps
+        # its billable tokens instead of recording them as unavailable.
+        raw_usage: dict[str, Any] | None = None
+        in_tokens: int | None = None
+        out_tokens: int | None = None
+        in_reported = False
+        out_reported = False
         try:
             key = self._require_key()
             if not self.base_url:
@@ -992,16 +1001,16 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                 # Legacy fixture shape: parsed JSON only, no transport bytes.
                 parsed = reply
             if self.protocol == "chat_completions":
-                text = _chat_text(parsed)
                 raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
                 in_tokens, in_reported = _extract_usage(raw_usage, "prompt_tokens")
                 out_tokens, out_reported = _extract_usage(raw_usage, "completion_tokens")
+                text = _chat_text(parsed)
             else:
-                text = (_messages_text(parsed) if self.protocol == "messages"
-                        else _responses_text(parsed))
                 raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
                 in_tokens, in_reported = _extract_usage(raw_usage, "input_tokens")
                 out_tokens, out_reported = _extract_usage(raw_usage, "output_tokens")
+                text = (_messages_text(parsed) if self.protocol == "messages"
+                        else _responses_text(parsed))
             usage_source = "measured" if (in_reported or out_reported) else "unavailable"
             cost = estimate_cost_usd(self.model, in_tokens, out_tokens)
             reported_model = parsed.get("model")
@@ -1041,15 +1050,18 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
                     exception_type=exc.exception_type,
                     observed_at=_now_iso(),
                 )
+            usage_measured = in_reported or out_reported
+            failure_cost = estimate_cost_usd(self.model, in_tokens, out_tokens)
             return CallResult(
                 call_id=call_id,
                 raw_output="",
-                input_tokens=None,
-                output_tokens=None,
-                usage_source="unavailable",
+                input_tokens=in_tokens,
+                output_tokens=out_tokens,
+                usage_source="measured" if usage_measured else "unavailable",
                 error_kind=_classify_opencode_error(exc),
                 pricing_version=PRICING_VERSION,
-                cost_source="unknown",
+                cost_usd=failure_cost,
+                cost_source="estimated" if failure_cost is not None else "unknown",
                 normalizer_version=NORMALIZER_VERSION,
                 effective_parameters=prepared.recorded_effective(),
                 protocol=self.protocol,

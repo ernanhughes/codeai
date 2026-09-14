@@ -2,8 +2,10 @@
 
 Deliberately no automatic provider construction or executable live default.
 After separate execution authorization, supply pinned ModelRouter instances to run.
-See router-prereg.md and router-implementation.md. Synthetic tests use test fixtures,
-never router_cases_v1.json as a source of experimental observations.
+See experiments/router-prereg.md (this repo) and
+docs/applied-ai/ch28-router-experiment-design.md (book repo, normative spec).
+Synthetic tests use test fixtures, never router_cases_v1 data as a source of
+experimental observations.
 """
 from codeai.router_experiment import build_schedule, run
 

@@ -209,6 +209,55 @@ def test_chat_malformed_and_empty_are_failures():
     assert failed.raw_output == ""
 
 
+def test_empty_content_with_usage_preserves_billable_tokens():
+    # Stage 29B top-first A05 shape: HTTP 200 reports usage but carries no
+    # output text. Usage is a fact about the response body, not the text, so
+    # the failure keeps the billable tokens instead of recording unavailable.
+    # kimi-k2.7-code is absent from the pricing table, so cost stays unknown
+    # (never pretend); the $0.0083 figure lives in the experiment's declared
+    # prices, not the adapter.
+    body = {
+        "id": "chatcmpl-a05",
+        "model": "kimi-k2.7-code",
+        "choices": [{"finish_reason": "length",
+                     "message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 92, "completion_tokens": 2048},
+    }
+    result = chat_adapter(model="kimi-k2.7-code",
+                          http_post=lambda *a: body).invoke(make_spec())
+    assert result.status == "failed"
+    assert "no output text" in (result.error or "")
+    assert (result.input_tokens, result.output_tokens) == (92, 2048)
+    assert result.usage_source == "measured"
+    assert result.cost_usd is None
+
+
+def test_empty_content_with_usage_and_known_pricing_estimates_cost():
+    # claude-haiku has no prefix collision in the pricing table (gpt-4o-mini
+    # would match the gpt-4o prefix first; named separately, not fixed here).
+    body = {
+        "id": "chatcmpl-priced",
+        "model": "claude-haiku",
+        "choices": [{"message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+    }
+    result = chat_adapter(model="claude-haiku",
+                          http_post=lambda *a: body).invoke(make_spec())
+    assert result.status == "failed"
+    assert (result.input_tokens, result.output_tokens) == (100, 50)
+    assert result.usage_source == "measured"
+    assert result.cost_usd == pytest.approx(100 / 1e6 * 0.25 + 50 / 1e6 * 1.25)
+
+
+def test_empty_content_without_usage_stays_unavailable():
+    body = {"id": "x", "choices": [{"message": {"content": ""}}]}
+    result = chat_adapter(http_post=lambda *a: body).invoke(make_spec())
+    assert result.status == "failed"
+    assert result.input_tokens is None and result.output_tokens is None
+    assert result.usage_source == "unavailable"
+    assert result.cost_usd is None
+
+
 def test_chat_effective_request_has_no_reasoning_effort():
     adapter = chat_adapter()
     prepared = adapter.prepare(

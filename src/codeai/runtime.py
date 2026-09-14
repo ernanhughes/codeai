@@ -51,6 +51,7 @@ from .domain import (
     AttemptRecord,
     AttemptStatus,
     Authority,
+    Budget,
     CallManifest,
     Capability,
     Claim,
@@ -196,11 +197,43 @@ class Runtime:
         self.policy = policy or PolicyEngine()
 
     def open_directive(self, directive: Directive, *, actor_id: str = "human") -> Event:
+        """Record a directive; declared children must narrow a recorded parent.
+
+        This validates registration, not caller identity or action authority.
+        Refusal raises before appending. Direct ledger writes remain outside
+        this application boundary.
+        """
+        parent_event = None
+        if directive.parent_directive_id is not None:
+            recorded = list(self.ledger.events_by_kind(("directive.opened",)))
+            if any(e.stream_id == directive.directive_id for e in recorded):
+                raise ValueError("child directive id is already registered")
+            if directive.directive_id == directive.parent_directive_id:
+                raise ValueError("child directive cannot be its own parent")
+            parents = [
+                e for e in recorded if e.stream_id == directive.parent_directive_id
+            ]
+            if len(parents) != 1:
+                raise ValueError("child directive requires one unambiguous recorded parent")
+            parent_event = parents[0]
+            payload = parent_event.payload
+            parent = Directive(
+                directive_id=str(payload["directive_id"]),
+                objective=str(payload["objective"]),
+                success_criteria=tuple(payload["success_criteria"]),
+                budget=Budget(**payload["budget"]),
+                authority=Authority(frozenset(
+                    Capability(value) for value in payload["authority"]["capabilities"]
+                )),
+                parent_directive_id=payload.get("parent_directive_id"),
+            )
+            parent.validate_child(directive)
         event = Event.create(
             stream_id=directive.directive_id,
             kind="directive.opened",
             actor_id=actor_id,
             payload=asdict(directive),
+            causation_id=parent_event.event_id if parent_event is not None else None,
             correlation_id=directive.directive_id,
         )
         self.ledger.append(event)
@@ -235,9 +268,9 @@ class Runtime:
 
         existing = self._find_action_result(request.idempotency_key)
         if existing is not None:
-            replay = replace(existing, action_id=request.action_id, reused_from_action_id=existing.action_id)
-            self._append_action_result_event(replay, actor_id=request.actor_id)
-            return replay
+            return self._replay_action_result(
+                request, existing, request_event, authority=authority
+            )
 
         started_at = now_utc()
         try:
@@ -261,6 +294,7 @@ class Runtime:
                 resulting_state_hash=observed_state,
             )
         except (AuthorityDenied, PreconditionMismatch) as exc:
+            observed_state = self._current_state_hash()
             finalized = ActionResult(
                 action_id=request.action_id,
                 status=ActionStatus.DENIED
@@ -268,16 +302,19 @@ class Runtime:
                 else ActionStatus.FAILED,
                 started_at=started_at,
                 completed_at=now_utc(),
-                resulting_state_hash=self._current_state_hash(),
+                resulting_state_hash=observed_state,
+                observed_state_hash=observed_state,
                 error=str(exc),
             )
         except RuntimeError as exc:
+            observed_state = self._current_state_hash()
             finalized = ActionResult(
                 action_id=request.action_id,
                 status=ActionStatus.FAILED,
                 started_at=started_at,
                 completed_at=now_utc(),
-                resulting_state_hash=self._current_state_hash(),
+                resulting_state_hash=observed_state,
+                observed_state_hash=observed_state,
                 error=str(exc),
             )
 
@@ -299,24 +336,46 @@ class Runtime:
         )
         self.ledger.append(request_event)
 
-        if (
-            request.target_state_hash is not None
-            and self._current_state_hash() is not None
-            and request.target_state_hash != self._current_state_hash()
-        ):
+        observed_state = None
+        binding_error = None
+        if request.target_state_hash is not None:
+            try:
+                observed_state = self._current_state_hash()
+            except Exception as exc:  # noqa: BLE001 - unavailable binding must not run the verifier
+                binding_error = f"target state observation failed: {type(exc).__name__}: {exc}"
+            else:
+                if observed_state is None:
+                    binding_error = "target state unavailable: requested binding cannot be checked"
+                elif request.target_state_hash != observed_state:
+                    binding_error = (
+                        f"target state mismatch: expected {request.target_state_hash}, "
+                        f"observed {observed_state}"
+                    )
+
+        if binding_error is not None:
             result = CheckResult(
                 check_id=request.check_id,
                 verdict=CheckVerdict.ERROR,
                 started_at=now_utc(),
                 completed_at=now_utc(),
-                error=(
-                    f"target state mismatch: expected {request.target_state_hash}, "
-                    f"observed {self._current_state_hash()}"
-                ),
+                error=binding_error,
             )
         else:
-            result = verifier.run(request)
+            started_at = now_utc()
+            try:
+                result = verifier.run(request)
+            except Exception as exc:  # noqa: BLE001 - a raising verifier is an ERROR, never a pass
+                result = CheckResult(
+                    check_id=request.check_id,
+                    verdict=CheckVerdict.ERROR,
+                    started_at=started_at,
+                    completed_at=now_utc(),
+                    error=f"verifier raised {type(exc).__name__}: {exc}",
+                )
             result = self._finalize_check_result(result)
+
+        # Never let a verifier supply the runtime's pre-check observation.
+        result = replace(result, observed_target_state_hash=observed_state)
 
         event = Event.create(
             stream_id=request.check_id,
@@ -2059,7 +2118,7 @@ class Runtime:
                     adapter=adapter,
                     max_attempts=raw_attempts,
                 )
-            except (ValueError, RuntimeError) as exc:  # never let one branch kill siblings
+            except Exception as exc:  # noqa: BLE001 - never let one branch kill siblings
                 result = CallResult(call_id=call_id, raw_output="", status="failed", error=str(exc))
                 self.ledger.append(
                     Event.create(
@@ -2511,6 +2570,98 @@ class Runtime:
             return self._action_result_from_payload(payload)
         return None
 
+    def _replay_action_result(
+        self,
+        request: ActionRequest,
+        existing: ActionResult,
+        request_event: Event,
+        *,
+        authority: Authority,
+    ) -> ActionResult:
+        """Return a recorded completion instead of performing a new effect.
+
+        Invariant: a key replays only the same recorded operation identity,
+        and replay cannot bypass current authority. Authority is checked
+        first so a denied caller learns nothing about the recorded operation
+        beyond the denial; identity is checked second so a colliding key can
+        never silently convert one operation into another.
+        """
+        started_at = now_utc()
+        try:
+            capability = Capability(str(request.capability))
+            self.policy.require(authority, capability)
+        except AuthorityDenied as exc:
+            observed_state = self._current_state_hash()
+            denied = ActionResult(
+                action_id=request.action_id,
+                status=ActionStatus.DENIED,
+                started_at=started_at,
+                completed_at=now_utc(),
+                resulting_state_hash=observed_state,
+                observed_state_hash=observed_state,
+                error=str(exc),
+            )
+            self._append_action_result_event(denied, actor_id=request.actor_id)
+            return denied
+        self._check_action_replay_fingerprint(request, existing, request_event)
+        replay = replace(
+            existing,
+            action_id=request.action_id,
+            reused_from_action_id=existing.action_id,
+        )
+        self._append_action_result_event(replay, actor_id=request.actor_id)
+        return replay
+
+    def _check_action_replay_fingerprint(
+        self,
+        request: ActionRequest,
+        existing: ActionResult,
+        request_event: Event,
+    ) -> None:
+        """Reject same-key, materially-different action requests before any effect.
+
+        The original request is rebuilt from its recorded action.requested
+        payload, so the check reproduces after ledger reopen. A conflict is
+        recorded durably as action.replay_refused; the in-memory raise alone
+        would leave action.requested unresolved.
+        """
+        original = next(
+            (
+                event
+                for event in self.ledger.events_by_kind(("action.requested",))
+                if event.stream_id == existing.action_id
+            ),
+            None,
+        )
+        if original is None:
+            dimensions = ("original_request",)
+        else:
+            dimensions = _mismatched_action_dimensions(
+                _action_request_fingerprint(request),
+                _action_payload_fingerprint(original.payload),
+            )
+        if dimensions:
+            self.ledger.append(
+                Event.create(
+                    stream_id=request.action_id,
+                    kind="action.replay_refused",
+                    actor_id=request.effective_requester(),
+                    payload={
+                        "requested_action_id": request.action_id,
+                        "idempotency_key": request.idempotency_key,
+                        "original_action_id": existing.action_id,
+                        "fingerprint_version": ACTION_FINGERPRINT_V1,
+                        "mismatched_dimensions": list(dimensions),
+                    },
+                    causation_id=request_event.event_id,
+                    correlation_id=request.task_id,
+                )
+            )
+            raise IdempotencyConflictError(
+                f"idempotency key {request.idempotency_key!r} matches completed action "
+                f"{existing.action_id!r} but the request differs in: {', '.join(dimensions)}"
+            )
+
     def _finalize_action_result(
         self,
         result: ActionResult,
@@ -2551,6 +2702,7 @@ class Runtime:
             started_at=result.started_at or started_at,
             completed_at=result.completed_at or completed_at,
             resulting_state_hash=result.resulting_state_hash or resulting_state_hash,
+            observed_state_hash=resulting_state_hash,
             artifacts=tuple(artifacts),
         )
 
@@ -2597,6 +2749,7 @@ class Runtime:
             artifacts=self._payload_artifacts(payload.get("artifacts")),
             state_hash=self._payload_value(payload, "state_hash"),
             resulting_state_hash=self._payload_value(payload, "resulting_state_hash"),
+            observed_state_hash=self._payload_value(payload, "observed_state_hash"),
             transcript=self._payload_value(payload, "transcript"),
             stdout=self._payload_value(payload, "stdout"),
             stderr=self._payload_value(payload, "stderr"),
@@ -2662,6 +2815,84 @@ class Runtime:
 def _prompt_hash_for_spec(spec: CallSpec) -> str:
     """Stable prompt identity shared by manifest construction and replay checks."""
     return hashlib.sha256(f"{spec.instruction}\0{spec.context.prompt}".encode()).hexdigest()
+
+
+ACTION_FINGERPRINT_V1 = "action-fingerprint-v1"
+
+ACTION_FINGERPRINT_DIMENSIONS = (
+    "capability",
+    "instruction",
+    "payload",
+    "precondition_hash",
+    "adapter",
+)
+
+
+def _canonical_payload_hash(payload: Mapping[str, object] | None) -> str:
+    """Stable identity for operation data: canonical JSON, never raw bytes."""
+    return hashlib.sha256(
+        json.dumps(dict(payload or {}), sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _action_fingerprint(
+    *,
+    capability: object,
+    instruction: object,
+    payload: Mapping[str, object] | None,
+    precondition_hash: object,
+    adapter: object,
+) -> tuple[str, str, str, str, str]:
+    """Logical action identity for idempotency matching.
+
+    Included: what operation (capability, instruction, payload), the world
+    state it was planned against (precondition_hash), and who performs it
+    (effective adapter id). Excluded: action_id and task_id (this request
+    instance and its correlation, not the operation), directive_id,
+    requested_by and actor_id (caller identity is authorized fresh at replay,
+    not remembered from the first execution).
+    """
+    return (
+        str(capability),
+        str(instruction),
+        _canonical_payload_hash(payload),
+        "" if precondition_hash is None else str(precondition_hash),
+        str(adapter),
+    )
+
+
+def _action_request_fingerprint(request: ActionRequest) -> tuple[str, str, str, str, str]:
+    return _action_fingerprint(
+        capability=request.capability,
+        instruction=request.instruction,
+        payload=request.payload,
+        precondition_hash=request.precondition_hash,
+        adapter=request.effective_adapter_id(),
+    )
+
+
+def _action_payload_fingerprint(payload: Mapping[str, object]) -> tuple[str, str, str, str, str]:
+    """Rebuild the fingerprint from a recorded action.requested payload."""
+    adapter_id = payload.get("adapter_id") or payload.get("adapter")
+    return _action_fingerprint(
+        capability=payload.get("capability"),
+        instruction=payload.get("instruction"),
+        payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+        precondition_hash=payload.get("precondition_hash"),
+        adapter=adapter_id,
+    )
+
+
+def _mismatched_action_dimensions(
+    actual: tuple[str, ...], expected: tuple[str, ...]
+) -> tuple[str, ...]:
+    return tuple(
+        dimension
+        for dimension, want, got in zip(ACTION_FINGERPRINT_DIMENSIONS, expected, actual)
+        if want != got
+    )
 
 
 def _request_fingerprint(spec: CallSpec) -> tuple[Any, ...]:

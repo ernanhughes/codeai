@@ -30,14 +30,14 @@ class SchedulerInput:
                 raise ValueError(f"conflicting legacy and explicit {name}")
             return new if new is not None else (old if old is not None else False)
 
-        values = dict(
-            has_required_verification=has_required_verification,
-            requests_independent_proposals=requests_independent_proposals,
-            requires_human_authority_for_next_effect=migrate(
+        values = {
+            "has_required_verification": has_required_verification,
+            "requests_independent_proposals": requests_independent_proposals,
+            "requires_human_authority_for_next_effect": migrate(
                 requires_destructive_capability, requires_human_authority_for_next_effect, "authority"),
-            process_budget_exhausted=migrate(budget_exhausted, process_budget_exhausted, "budget"),
-            model_budget_exhausted=model_budget_exhausted,
-        )
+            "process_budget_exhausted": migrate(budget_exhausted, process_budget_exhausted, "budget"),
+            "model_budget_exhausted": model_budget_exhausted,
+        }
         for name, value in values.items():
             if type(value) is not bool:
                 raise TypeError(f"{name} must be a bool")

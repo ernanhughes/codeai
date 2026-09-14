@@ -274,9 +274,25 @@ def verify_ledger(ledger_path, artifact_dir, run_id):
             raw = json.loads(artifact(evidence["raw_output_ref"]))
             artifact(evidence["prompt_ref"])
             attempts = [v for k, v in all_events if k == "attempt.completed" and v.get("attempt_id") == evidence["attempt_id"]]
-            if len(attempts) != 1 or attempts[0] != evidence["attempt"]:
-                raise ValueError("missing or changed attempt")
+            if len(attempts) != 1:
+                raise ValueError("missing attempt")
             attempt = attempts[0]
+            # The ledger stores a projection (_attempt_payload), not asdict(AttemptRecord):
+            # whole-dict equality across representations is meaningless. Check identity
+            # linkage plus agreement on every security-relevant field instead. The raw
+            # re-parse below remains the strong guarantee.
+            recorded = evidence["attempt"]
+            for key in ("attempt_id", "call_id", "task_id", "status", "resolved_model_id",
+                        "provider", "cost_usd", "pricing_version"):
+                if attempt.get(key) != recorded.get(key):
+                    raise ValueError(f"attempt observation mismatch: {key}")
+            for key in ("input_tokens", "output_tokens"):
+                if (attempt.get("usage") or {}).get(key) != (recorded.get("usage") or {}).get(key):
+                    raise ValueError(f"attempt usage mismatch: {key}")
+            if str((attempt.get("usage") or {}).get("source")) != str((recorded.get("usage") or {}).get("source")):
+                raise ValueError("attempt usage-source mismatch")
+            if (attempt.get("raw_artifact") or {}).get("sha256") != (recorded.get("raw_artifact") or {}).get("sha256"):
+                raise ValueError("attempt raw-artifact mismatch")
             inter = [v for k, v in all_events if k == "attempt.interpreted" and v.get("attempt_id") == attempt["attempt_id"]]
             if len(inter) != 1:
                 raise ValueError("missing interpretation")

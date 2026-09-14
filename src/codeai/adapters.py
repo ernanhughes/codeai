@@ -289,6 +289,11 @@ class ActionResult:
     output_tokens: int = 0
     error: str | None = None
     reused_from_action_id: str | None = None
+    # Runtime-owned reading from state_resolver after execution (or refusal).
+    # Never taken from the adapter. None means no runtime reading is available.
+    # On reuse this remains the original reading, not a fresh observation.
+    # resulting_state_hash retains its legacy adapter-first/fallback semantics.
+    observed_state_hash: str | None = None
 
 
 class ExecutionAdapter(Protocol):
@@ -331,6 +336,10 @@ class CheckResult:
     stderr: str | None = None
     details: str | None = None
     error: str | None = None
+    # Runtime-owned reading before verifier invocation, when target_state_hash
+    # was requested. None means no reading was obtained (or none requested).
+    # This is not a reading of what the verifier actually consumed, nor a lock.
+    observed_target_state_hash: str | None = None
 
 
 class VerificationAdapter(Protocol):

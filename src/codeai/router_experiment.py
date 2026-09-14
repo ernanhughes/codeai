@@ -8,8 +8,14 @@ from .domain import Authority, Budget, Directive, Task
 from .ledger import Event
 from .providers import PRICING_TABLE, PRICING_VERSION
 from .router_contract import (
-    EXPERIMENT_VERSION, PATHS, canonical, deterministic_extract, digest,
-    freeze_manifest, state_from_dict, validate_corpus,
+    EXPERIMENT_VERSION,
+    PATHS,
+    canonical,
+    deterministic_extract,
+    digest,
+    freeze_manifest,
+    state_from_dict,
+    validate_corpus,
 )
 from .router_model import PROMPTS, ModelRouter
 from .scheduler import POLICY_VERSION, decide_next_step
@@ -33,9 +39,10 @@ def build_schedule(corpus, model_keys, *, synthetic=False):
                 variations.append((model_keys[0], "router-prompt-v1", "field_order"))
             for model_key, prompt, variant in variations:
                 for repeat in range(1 if synthetic else (5 if model else 3)):
-                    rows.append(dict(case_id=case.case_id, component=case.component, path=path,
-                                     model_key=model_key, prompt_version=prompt,
-                                     variant=variant, repeat=repeat))
+                    rows.append({"case_id": case.case_id, "component": case.component,
+                                     "path": path, "model_key": model_key,
+                                     "prompt_version": prompt, "variant": variant,
+                                     "repeat": repeat})
     return rows
 
 
@@ -81,10 +88,11 @@ def run(runtime, corpus, oracle, manifest, routers: dict[str, ModelRouter], *,
         runtime.ledger.append(Event.create(stream_id=stream, kind=kind, actor_id="router-experiment",
                                           correlation_id=run_id, payload=payload))
 
-    emit("router.run_started", dict(version=EXPERIMENT_VERSION, run_id=run_id,
-         synthetic=synthetic, corpus_hash=digest(corpus), oracle_hash=digest(oracle),
-         manifest_hash=digest(manifest), refs=refs, schedule=schedule, pricing=pricing,
-         policy_version=POLICY_VERSION))
+    emit("router.run_started", {"version": EXPERIMENT_VERSION, "run_id": run_id,
+         "synthetic": synthetic, "corpus_hash": digest(corpus),
+         "oracle_hash": digest(oracle), "manifest_hash": digest(manifest),
+         "refs": refs, "schedule": schedule, "pricing": pricing,
+         "policy_version": POLICY_VERSION})
     directive_id = run_id + ":directive"
     runtime.open_directive(Directive(directive_id, "Compare operation selection only", (),
                                       Budget(), Authority()))
