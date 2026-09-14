@@ -552,6 +552,14 @@ def _validate_check(
     return reasons
 
 
+def preserved_output_text(runtime: Runtime, attempt_id: str) -> str:
+    """Output text read from an attempt's preserved response bytes.
+
+    Raises ObservationUnavailable when the observation or its bytes cannot be read.
+    """
+    return _observation_text(runtime, attempt_id)[0]
+
+
 def _observation_text(runtime: Runtime, attempt_id: str) -> tuple[str, Event]:
     observed = next(
         (e for e in runtime.ledger.events_by_kind(("attempt.observed",))
