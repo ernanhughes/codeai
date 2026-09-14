@@ -29,6 +29,15 @@ def collect_experiment(runtime: Any, experiment_id: str) -> dict[str, Any]:
         e.payload for e in runtime.ledger.events_by_kind(("call.completed",))
         if str(e.payload.get("experiment_id", "")) == experiment_id
     ]
+    # The prompt variant is recorded on call.requested, not call.completed.
+    # Without this join, exported rows cannot attribute a call to its stance.
+    call_ids = {str(c.get("call_id")) for c in calls}
+    prompt_variants = {
+        e.stream_id: (e.payload.get("variant") or {}).get("prompt_variant")
+        for e in runtime.ledger.events_by_kind(("call.requested",))
+        if e.stream_id in call_ids
+    }
+    calls = [{**c, "prompt_variant": prompt_variants.get(str(c.get("call_id")))} for c in calls]
     candidates = [
         e.payload for e in runtime.ledger.events_by_kind(("experiment.candidate_verified",))
         if str(e.payload.get("experiment_id")) == experiment_id
@@ -254,9 +263,14 @@ def export_experiment(runtime: Any, experiment_id: str) -> dict[str, Any]:
             "corpus_version": config.corpus_version,
             "task_ids": list(config.task_ids),
             "arms": [
+                # Prompt suffixes and stance labels are the independent variable of
+                # a prompt experiment; an export without them cannot show which
+                # wording each arm received (the P2/P3 frozen exports lack them).
                 {"name": a.name, "models": list(a.models), "samples": a.samples,
                  "temperature": a.temperature, "seed": a.seed,
-                 "prompt_version": a.prompt_version}
+                 "prompt_version": a.prompt_version,
+                 "prompt_suffixes": list(a.prompt_suffixes),
+                 "stance_labels": list(a.stance_labels)}
                 for a in config.arms
             ],
             "budget": {

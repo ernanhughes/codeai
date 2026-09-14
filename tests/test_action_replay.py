@@ -45,6 +45,31 @@ def write_auth():
     return Authority(frozenset({Capability.WRITE}))
 
 
+class TransportDropAfterEffectWriter(CountingWriter):
+    def execute(self, request: ActionRequest) -> ActionResult:
+        self.calls += 1
+        raise ConnectionError("connection reset after the write")
+
+
+def test_non_runtime_error_after_effect_is_recorded_and_replayed_not_repeated(tmp_path):
+    # Regression: only RuntimeError was recorded. A ConnectionError (an OSError)
+    # after the effect left action.requested with no completion, so a same-key
+    # retry found nothing to replay and executed the effect a second time.
+    ledger = SQLiteLedger(tmp_path / "ledger.sqlite")
+    runtime = Runtime(ledger)
+    writer = TransportDropAfterEffectWriter()
+    first = runtime.execute_action(write_request("a1"), authority=write_auth(), adapter=writer)
+    second = runtime.execute_action(write_request("a2"), authority=write_auth(), adapter=writer)
+    assert writer.calls == 1
+    assert first.status == second.status == ActionStatus.FAILED
+    assert "connection reset" in (first.error or "")
+    assert second.reused_from_action_id == "a1"
+    assert [e.kind for e in ledger.read_all()] == [
+        "action.requested", "action.completed", "action.requested", "action.completed",
+    ]
+    ledger._conn.close()
+
+
 def test_exact_duplicate_replays_with_one_physical_effect(tmp_path):
     ledger = SQLiteLedger(tmp_path / "ledger.sqlite")
     runtime = Runtime(ledger)

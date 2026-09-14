@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from codeai.adapters import FakeCognitionAdapter
+from codeai.analysis import export_experiment
 from codeai.artifacts import FileArtifactStore
 from codeai.corpus import seeded_corpus
 from codeai.experiments import (
@@ -98,6 +99,40 @@ def test_stance_arms_share_fanout_with_variant_tags(tmp_path):
     arm = next(a for a in stored.payload["arms"] if a["name"] == "P2S")
     assert len(arm["prompt_suffixes"]) == 12 and len(arm["stance_labels"]) == 12
     assert STANCES == ("normal", "assumption_challenge", "minimality", "counterfactual")
+
+
+def test_export_carries_the_prompt_variable_of_each_arm(tmp_path):
+    # Regression: the export once dropped prompt_suffixes/stance_labels, so a
+    # matched prompt replication (normal x12 vs counterfactual x12) exported two
+    # arm configs identical except for their names.
+    runtime = make_runtime(tmp_path)
+    task = seeded_corpus()[0]
+    cf = stance_suffix(COUNTERFACTUAL)
+    config = build_config(
+        name="p3test",
+        hypothesis="h",
+        task_ids=(task.task_id,),
+        arms=(
+            ArmDef(name="P3C", models=("m",), samples=2),
+            ArmDef(name="P3CF", models=("m",), samples=2,
+                   prompt_suffixes=(cf, cf), stance_labels=(COUNTERFACTUAL, COUNTERFACTUAL)),
+        ),
+        budget=ExperimentBudget(),
+    )
+    create_experiment(runtime, config)
+    stub = StubModelConfig(FakeCognitionAdapter(responses=["```python\nx = 1\n```"]))
+    run_arm(runtime, config.experiment_id, "P3CF", (task,), stub,
+            candidates_root=tmp_path / "cand")
+    exported = export_experiment(runtime, config.experiment_id)
+    cf_calls = [c for c in exported["calls"] if c.get("arm") == "P3CF"]
+    assert len(cf_calls) == 2
+    assert {c["prompt_variant"] for c in cf_calls} == {COUNTERFACTUAL}
+    arms = {a["name"]: a for a in exported["experiment"]["arms"]}
+    assert arms["P3C"]["prompt_suffixes"] == [] and arms["P3C"]["stance_labels"] == []
+    assert arms["P3CF"]["prompt_suffixes"] == [cf, cf]
+    assert arms["P3CF"]["stance_labels"] == [COUNTERFACTUAL, COUNTERFACTUAL]
+    assert {k: v for k, v in arms["P3C"].items() if k not in ("name", "prompt_suffixes", "stance_labels")} \
+        == {k: v for k, v in arms["P3CF"].items() if k not in ("name", "prompt_suffixes", "stance_labels")}
 
 
 def test_control_arm_uses_unmodified_prompts(tmp_path):

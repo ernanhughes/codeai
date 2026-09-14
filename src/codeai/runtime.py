@@ -306,7 +306,11 @@ class Runtime:
                 observed_state_hash=observed_state,
                 error=str(exc),
             )
-        except RuntimeError as exc:
+        except Exception as exc:  # noqa: BLE001 - any adapter failure may follow a real effect
+            # Record it so a same-key retry replays FAILED instead of acting again.
+            # Transport errors are usually OSError subclasses, not RuntimeError;
+            # catching only RuntimeError left no completion and let a retry
+            # duplicate the effect.
             observed_state = self._current_state_hash()
             finalized = ActionResult(
                 action_id=request.action_id,
