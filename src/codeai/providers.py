@@ -1080,6 +1080,44 @@ class OpenCodeCognitionAdapter(CognitionAdapter):
         """Legacy entry: prepare once, then send the prepared request."""
         return replace(self.send(self.prepare(spec)), call_id=spec.call_id)
 
+    def prompt(
+        self,
+        text: str,
+        *,
+        instruction: str = "",
+        task_id: str | None = None,
+        prompt_version: str | None = None,
+    ) -> CallResult:
+        """Send one prompt and return the CallResult; the simplest callable model.
+
+        Builds the actor, context package and CallSpec that invoke() needs,
+        generating call, task and idempotency ids when none are given. It adds
+        no retries, no history and no ledger: failure still arrives in
+        ``status``/``error``, never as ``raw_output``.
+        """
+        import uuid as _uuid
+
+        from .context import ContextCompiler
+        from .domain import ActorRef
+
+        task_id = task_id or f"prompt-{_uuid.uuid4().hex[:12]}"
+        actor = ActorRef(
+            actor_id="prompt", kind="model", provider=self.GATEWAY, model=self.model
+        )
+        package = ContextCompiler().compile(
+            task_id=task_id, actor=actor, prompt=text, prompt_version=prompt_version
+        )
+        spec = CallSpec(
+            call_id=str(_uuid.uuid4()),
+            task_id=task_id,
+            actor=actor,
+            context=package,
+            idempotency_key=str(_uuid.uuid4()),
+            instruction=instruction,
+            prompt_version=prompt_version,
+        )
+        return self.invoke(spec)
+
 
 def _now_iso() -> str:
     from datetime import UTC, datetime
