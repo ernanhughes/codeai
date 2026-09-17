@@ -59,6 +59,11 @@ class StaticVerifier:
             started_at="2026-09-13T00:00:00+00:00",
             completed_at="2026-09-13T00:00:00+00:00",
             exit_code=0 if self.verdict == CheckVerdict.PASS else 1,
+            inconclusive_reason=(
+                "the fixture cannot disambiguate this criterion"
+                if self.verdict == CheckVerdict.INCONCLUSIVE
+                else None
+            ),
         )
 
 

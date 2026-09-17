@@ -106,6 +106,13 @@ from .rendering import (
     render_context,
 )
 from .process_state import PROCESS_STATE_V1, ProcessState, project_process_state, state_snapshot
+from .verification import (
+    VerificationBinding,
+    apply_verification_to_claims,
+    bind_check_target,
+    inconclusive_checks_for_claim,
+)
+from .verification import run_check as _run_check
 from .authority import (
     AUTHORITY_RESOLUTION_V1,
     AuthorizationDecision,
@@ -477,67 +484,21 @@ class Runtime:
         *,
         verifier: VerificationAdapter,
     ) -> CheckResult:
-        request_event = Event.create(
-            stream_id=request.check_id,
-            kind="check.requested",
-            actor_id="verifier",
-            payload=asdict(request),
-            correlation_id=request.task_id,
-        )
-        self.ledger.append(request_event)
+        """Bind, verify, record, apply; see codeai.verification.
 
-        observed_state = None
-        binding_error = None
-        if request.target_state_hash is not None:
-            try:
-                observed_state = self._current_state_hash()
-            except Exception as exc:  # noqa: BLE001 - unavailable binding must not run the verifier
-                binding_error = f"target state observation failed: {type(exc).__name__}: {exc}"
-            else:
-                if observed_state is None:
-                    binding_error = "target state unavailable: requested binding cannot be checked"
-                elif request.target_state_hash != observed_state:
-                    binding_error = (
-                        f"target state mismatch: expected {request.target_state_hash}, "
-                        f"observed {observed_state}"
-                    )
+        PASS, FAIL, INCONCLUSIVE and ERROR stay four different answers. A
+        binding failure is always ERROR: the measurement broke, which is not the
+        same as the world being unclear.
+        """
+        return _run_check(self, request, verifier=verifier)
 
-        if binding_error is not None:
-            result = CheckResult(
-                check_id=request.check_id,
-                verdict=CheckVerdict.ERROR,
-                started_at=now_utc(),
-                completed_at=now_utc(),
-                error=binding_error,
-            )
-        else:
-            started_at = now_utc()
-            try:
-                result = verifier.run(request)
-            except Exception as exc:  # noqa: BLE001 - a raising verifier is an ERROR, never a pass
-                result = CheckResult(
-                    check_id=request.check_id,
-                    verdict=CheckVerdict.ERROR,
-                    started_at=started_at,
-                    completed_at=now_utc(),
-                    error=f"verifier raised {type(exc).__name__}: {exc}",
-                )
-            result = self._finalize_check_result(result)
+    def check_binding(self, request: CheckRequest) -> VerificationBinding:
+        """What the runtime can establish about the state a check would examine."""
+        return bind_check_target(self, request)
 
-        # Never let a verifier supply the runtime's pre-check observation.
-        result = replace(result, observed_target_state_hash=observed_state)
-
-        event = Event.create(
-            stream_id=request.check_id,
-            kind="check.completed",
-            actor_id="verifier",
-            payload=asdict(result),
-            causation_id=request_event.event_id,
-            correlation_id=request.task_id,
-        )
-        self.ledger.append(event)
-        self._apply_check_to_claims(request, result)
-        return result
+    def inconclusive_checks_for_claim(self, claim_id: str) -> tuple[dict[str, object], ...]:
+        """Checks that ran against this claim and settled nothing."""
+        return inconclusive_checks_for_claim(self, claim_id)
 
     # ------------------------------------------------------------------
     # Task acceptance: the only path to task.completed
@@ -2770,41 +2731,8 @@ class Runtime:
         )
 
     def _apply_check_to_claims(self, request: CheckRequest, result: CheckResult) -> None:
-        """Scoped evidence promotion: only claims the check actually targeted."""
-        if not request.claim_ids:
-            return
-        if result.verdict == CheckVerdict.PASS:
-            for claim_id in request.claim_ids:
-                self.ledger.append(
-                    Event.create(
-                        stream_id=str(claim_id),
-                        kind="claim.evidence",
-                        actor_id="verifier",
-                        payload={
-                            "claim_id": str(claim_id),
-                            "evidence_class": EvidenceClass.REPRODUCED.value,
-                            "check_id": result.check_id,
-                            "details": "deterministic check passed for targeted claim",
-                        },
-                        correlation_id=request.task_id,
-                    )
-                )
-        elif result.verdict == CheckVerdict.FAIL:
-            for claim_id in request.claim_ids:
-                self.ledger.append(
-                    Event.create(
-                        stream_id=str(claim_id),
-                        kind="claim.status",
-                        actor_id="verifier",
-                        payload={
-                            "claim_id": str(claim_id),
-                            "status": ClaimStatus.REFUTED.value,
-                            "check_id": result.check_id,
-                            "details": "deterministic check failed for targeted claim",
-                        },
-                        correlation_id=request.task_id,
-                    )
-                )
+        """Scoped evidence promotion; the semantics live in codeai.verification."""
+        apply_verification_to_claims(self, request, result)
 
     def _find_action_result(self, idempotency_key: str) -> ActionResult | None:
         for event in self.ledger.events_by_kind(("action.completed",)):
@@ -2986,7 +2914,7 @@ class Runtime:
             reused_from_action_id=self._payload_value(payload, "reused_from_action_id"),
         )
 
-    def _finalize_check_result(self, result: CheckResult) -> CheckResult:
+    def _store_check_artifacts(self, result: CheckResult) -> CheckResult:
         artifacts = list(result.artifacts)
         if self.artifact_store is not None:
             if result.stdout:

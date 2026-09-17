@@ -34,6 +34,22 @@ def test_ch22_action_recovery_example(capsys):
     assert summary["result_status_after_reconciliation"] == "failed"
 
 
+def test_ch21_verification_example(capsys):
+    summary = load("ch21_verification.py").main()
+    capsys.readouterr()
+
+    assert summary["verdicts"] == ["PASS", "FAIL", "INCONCLUSIVE", "ERROR"]
+    assert summary["bindings"] == ["bound", "bound", "bound", "mismatch"]
+    # The inconclusive check ran and said why; the errored one measured nothing.
+    assert "declared inconclusive by exit-code-v1" in summary["inconclusive_reason"]
+    assert "cannot read it as prose" in summary["inconclusive_reason"]
+    assert summary["errored_check_ran_nothing"] is True
+    assert summary["error_reason"].startswith("target state mismatch")
+    # The mapping was declared before the command ran, and recorded with it.
+    assert summary["declared_policy"]["inconclusive_codes"] == [2]
+    assert summary["verifier_identity"] == "LocalCommandVerifier"
+
+
 def test_ch28_scheduler_example(capsys):
     summary = load("ch28_scheduler.py").main()
     capsys.readouterr()
