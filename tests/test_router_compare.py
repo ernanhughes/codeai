@@ -52,7 +52,8 @@ def test_legacy_v1_matrix(v, p, h, b):
     expected = "STOP" if b else "CHECK" if v else "CALL" if p else "ASK_HUMAN" if h else "STOP"
     result = decide_next_step(SchedulerInput(v, p, h, b))
     assert result.operation == expected
-    assert result.policy_version == "epistemic-v2"
+    # The matrix is unchanged; the version moved because the policy gained a rule.
+    assert result.policy_version == "epistemic-v3"
     assert "budget_exhausted" not in asdict(SchedulerInput(budget_exhausted=b))
 
 

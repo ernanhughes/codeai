@@ -33,9 +33,27 @@ def digest(value) -> str:
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
+# The v1 corpus was written against the five-flag schema. Later policy versions
+# added facts (unresolved_effect, process_complete), so a v1 state is still
+# explicit and still valid; it simply predates them. This set is written out
+# rather than derived from SchedulerInput, because it describes frozen evidence:
+# it must not drift when the live schema grows. Legacy aliases stay rejected.
+V1_STATE_FIELDS = (
+    "has_required_verification",
+    "requests_independent_proposals",
+    "requires_human_authority_for_next_effect",
+    "process_budget_exhausted",
+    "model_budget_exhausted",
+)
+assert set(V1_STATE_FIELDS) <= set(STATE_FIELDS), "v1 state names must still exist"
+
+
 def state_from_dict(value: dict) -> SchedulerInput:
-    if not isinstance(value, dict) or set(value) != set(STATE_FIELDS):
-        raise ValueError("explicit five-field state required; no legacy aliases")
+    if not isinstance(value, dict) or set(value) not in (
+        set(STATE_FIELDS),
+        set(V1_STATE_FIELDS),
+    ):
+        raise ValueError("explicit state required; no legacy aliases")
     return SchedulerInput(**value)
 
 
