@@ -34,6 +34,24 @@ def test_ch22_action_recovery_example(capsys):
     assert summary["result_status_after_reconciliation"] == "failed"
 
 
+def test_ch28_scheduler_example(capsys):
+    summary = load("ch28_scheduler.py").main()
+    capsys.readouterr()
+
+    # Each decision came from facts the ledger established, in this order.
+    assert summary["decisions"] == ["CALL", "CHECK", "ASK_HUMAN", "STOP"]
+    # The task stopped because an acceptance completed it, not because a caller
+    # said so: the directive never granted ACCEPT.
+    assert summary["final_state"]["process_complete"] is True
+    assert summary["final_state"]["acceptance_authority_available"] is False
+    # Decision 2 is history. The world moved on; the record did not.
+    assert summary["recorded_second"] == "CHECK"
+    assert summary["reprojected_now"] == "STOP"
+    assert summary["replayed_second"] == "CHECK"
+    assert summary["second_state_check_satisfied"] is False
+    assert summary["basis_events"] >= 1
+
+
 def test_ch20_authority_example(capsys):
     summary = load("ch20_authority.py").main()
     capsys.readouterr()

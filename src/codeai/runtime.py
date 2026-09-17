@@ -105,6 +105,7 @@ from .rendering import (
     prepared_input_text,
     render_context,
 )
+from .process_state import PROCESS_STATE_V1, ProcessState, project_process_state, state_snapshot
 from .authority import (
     AUTHORITY_RESOLUTION_V1,
     AuthorizationDecision,
@@ -2485,9 +2486,57 @@ class Runtime:
         )
         return package, trace
 
+    def process_state(self, task_id: str) -> ProcessState:
+        """What is true about the task, derived from the ledger. Appends nothing."""
+        return project_process_state(self, task_id)
+
+    def decide_next_for_task(self, task_id: str, *, actor_id: str = "runtime") -> object:
+        """Project the state, decide from it, and record the decision with its basis.
+
+        The scheduler stays pure: it sees only facts the projection derived, and
+        the recorded event carries those facts, so the decision can be
+        reconstructed later instead of re-derived from whatever is true then.
+        """
+        from .scheduler import decide_next_step
+
+        state = self.process_state(task_id)
+        decision = decide_next_step(state.to_scheduler_input())
+        self.record_scheduler_decision(state, decision, actor_id=actor_id)
+        return decision
+
+    def record_scheduler_decision(
+        self, state: ProcessState, decision: object, *, actor_id: str = "runtime"
+    ) -> Event:
+        """Append the decision, the facts it rested on, and the events behind them."""
+        snapshot = state_snapshot(state)
+        event = Event.create(
+            stream_id=state.task_id,
+            kind="scheduler.decision_recorded",
+            actor_id=actor_id,
+            payload={
+                "decision_id": str(uuid.uuid4()),
+                "task_id": state.task_id,
+                "operation": str(getattr(decision, "operation", decision)),
+                "reason_code": getattr(decision, "reason", ""),
+                "policy_version": getattr(decision, "policy_version", None),
+                "projection_version": PROCESS_STATE_V1,
+                "state": snapshot,
+                "process_state_sha256": hashlib.sha256(
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "basis_event_ids": list(state.basis_event_ids),
+            },
+            correlation_id=state.task_id,
+        )
+        self.ledger.append(event)
+        return event
+
     def decide_next(self, query: object) -> object:
         from .scheduler import decide_next_step
 
+        if isinstance(query, str):
+            # Ergonomic façade: a task id means project, decide and record.
+            return self.decide_next_for_task(query)
         return decide_next_step(query)  # type: ignore[arg-type]
 
     def list_runs(self) -> tuple[dict[str, object], ...]:
