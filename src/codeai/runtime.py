@@ -105,6 +105,13 @@ from .rendering import (
     prepared_input_text,
     render_context,
 )
+from .actions import (
+    ACTION_RECOVERY_V1,
+    ActionWorkState,
+    project_action_state,
+    project_open_effects,
+)
+from .actions import reconcile_action as _reconcile_action
 from .workstate import WorkState, project_work_state
 from .workstate import resume_call as _resume_call
 
@@ -261,7 +268,10 @@ class Runtime:
             stream_id=request.action_id,
             kind="action.requested",
             actor_id=request.effective_requester(),
-            payload=asdict(request),
+            # recovery_version marks a request whose runtime commits
+            # action.execution_started before the adapter runs, so a later
+            # reader can tell "no effect was possible" from "effect unknown".
+            payload={**asdict(request), "recovery_version": ACTION_RECOVERY_V1},
             correlation_id=request.task_id,
         )
         self.ledger.append(request_event)
@@ -285,6 +295,26 @@ class Runtime:
                 raise PreconditionMismatch(
                     f"precondition mismatch: expected {request.precondition_hash}, observed {current_state}"
                 )
+            # Committed before the effect, so an interruption after this point
+            # is recorded as effect-unknown rather than as no effect at all.
+            self.ledger.append(
+                Event.create(
+                    stream_id=request.action_id,
+                    kind="action.execution_started",
+                    actor_id=request.actor_id,
+                    payload={
+                        "action_id": request.action_id,
+                        "task_id": request.task_id,
+                        "idempotency_key": request.idempotency_key,
+                        "adapter": request.effective_adapter_id(),
+                        "capability": str(request.capability),
+                        "started_at": started_at,
+                        "version": ACTION_RECOVERY_V1,
+                    },
+                    causation_id=request_event.event_id,
+                    correlation_id=request.task_id,
+                )
+            )
             result = adapter.execute(request)
             observed_state = self._current_state_hash()
             finalized = self._finalize_action_result(
@@ -454,6 +484,33 @@ class Runtime:
     def work_state(self, task_id: str) -> WorkState:
         """Project attempted, failed, unresolved and safe-next work; appends nothing."""
         return project_work_state(self, task_id)
+
+    def action_state(self, action_id: str) -> ActionWorkState | None:
+        """Classify one action: result status, effect state, and what is safe next."""
+        return project_action_state(self.ledger.read_all(), action_id)
+
+    def open_effects(self, *, task_id: str | None = None) -> tuple[ActionWorkState, ...]:
+        """Every action whose record leaves the effect unknown, for a person to resolve."""
+        return project_open_effects(self.ledger.read_all(), task_id=task_id)
+
+    def reconcile_action(
+        self,
+        action_id: str,
+        *,
+        verdict: str,
+        actor_id: str,
+        evidence_refs: tuple[str, ...] = (),
+        basis: str | None = None,
+    ) -> ActionWorkState:
+        """Record later evidence about an unknown effect; never erases the record."""
+        return _reconcile_action(
+            self,
+            action_id,
+            verdict=verdict,
+            actor_id=actor_id,
+            evidence_refs=evidence_refs,
+            basis=basis,
+        )
 
     def resume_call(
         self, call_id: str, *, adapter: CognitionAdapter, model_config: Any | None = None

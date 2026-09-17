@@ -65,7 +65,9 @@ def test_non_runtime_error_after_effect_is_recorded_and_replayed_not_repeated(tm
     assert "connection reset" in (first.error or "")
     assert second.reused_from_action_id == "a1"
     assert [e.kind for e in ledger.read_all()] == [
-        "action.requested", "action.completed", "action.requested", "action.completed",
+        # execution_started marks the first attempt; the replay never reaches it.
+        "action.requested", "action.execution_started", "action.completed",
+        "action.requested", "action.completed",
     ]
     ledger._conn.close()
 
@@ -80,7 +82,9 @@ def test_exact_duplicate_replays_with_one_physical_effect(tmp_path):
     assert first.status == second.status == ActionStatus.SUCCEEDED
     assert second.reused_from_action_id == "a1"
     assert [e.kind for e in ledger.read_all()] == [
-        "action.requested", "action.completed", "action.requested", "action.completed",
+        # execution_started marks the first attempt; the replay never reaches it.
+        "action.requested", "action.execution_started", "action.completed",
+        "action.requested", "action.completed",
     ]
     ledger._conn.close()
     reopened = SQLiteLedger(tmp_path / "ledger.sqlite")

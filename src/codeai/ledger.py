@@ -66,6 +66,10 @@ class ArtifactRecord:
 class SQLiteLedger:
     """Append-only event ledger. Updates and deletes are intentionally absent."""
 
+    def close(self) -> None:
+        """Release the connection. The events stay; only this handle goes."""
+        self._conn.close()
+
     def __init__(self, path: str | Path = ":memory:") -> None:
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row

@@ -80,6 +80,7 @@ def test_allowed_action_records_request_and_result(tmp_path: Path):
     assert adapter.calls == 1
     assert [event.kind for event in runtime.ledger.read_all()] == [
         "action.requested",
+        "action.execution_started",  # committed before the adapter acts
         "action.completed",
     ]
 
