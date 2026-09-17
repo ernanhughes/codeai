@@ -65,9 +65,10 @@ def test_non_runtime_error_after_effect_is_recorded_and_replayed_not_repeated(tm
     assert "connection reset" in (first.error or "")
     assert second.reused_from_action_id == "a1"
     assert [e.kind for e in ledger.read_all()] == [
-        # execution_started marks the first attempt; the replay never reaches it.
-        "action.requested", "action.execution_started", "action.completed",
-        "action.requested", "action.completed",
+        # authorized before any disclosure; execution_started marks the first
+        # attempt; the replay is authorized again but never reaches execution.
+        "action.requested", "action.authorized", "action.execution_started", "action.completed",
+        "action.requested", "action.authorized", "action.completed",
     ]
     ledger._conn.close()
 
@@ -82,9 +83,10 @@ def test_exact_duplicate_replays_with_one_physical_effect(tmp_path):
     assert first.status == second.status == ActionStatus.SUCCEEDED
     assert second.reused_from_action_id == "a1"
     assert [e.kind for e in ledger.read_all()] == [
-        # execution_started marks the first attempt; the replay never reaches it.
-        "action.requested", "action.execution_started", "action.completed",
-        "action.requested", "action.completed",
+        # authorized before any disclosure; execution_started marks the first
+        # attempt; the replay is authorized again but never reaches execution.
+        "action.requested", "action.authorized", "action.execution_started", "action.completed",
+        "action.requested", "action.authorized", "action.completed",
     ]
     ledger._conn.close()
     reopened = SQLiteLedger(tmp_path / "ledger.sqlite")
@@ -122,7 +124,7 @@ def test_key_collision_conflicts_with_zero_new_effects(field, value, dimension):
     assert refused[0].payload["idempotency_key"] == "k"
     assert refused[0].payload["fingerprint_version"] == ACTION_FINGERPRINT_V1
     assert dimension in refused[0].payload["mismatched_dimensions"]
-    assert len(ledger.read_all()) == before + 2  # requested + replay_refused
+    assert len(ledger.read_all()) == before + 3  # requested + authorized + replay_refused
     ledger._conn.close()
 
 
