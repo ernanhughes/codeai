@@ -540,7 +540,12 @@ def _validate_check(
         reasons.append("check_wrong_task")
     if request.claim_id not in (check.get("claim_ids") or ()):
         reasons.append("check_not_targeting_claim")
-    if verdict not in ("PASS", "FAIL"):
+    if verdict == "ERROR":
+        # No trustworthy result was obtained, so this check bears on nothing.
+        # Reading it as evidence either way would turn a broken measurement into
+        # a finding about the claim.
+        reasons.append("check_errored")
+    elif verdict not in ("PASS", "FAIL"):
         reasons.append("check_inconclusive")
     elif (verdict == "PASS") != (request.verdict == SUPPORTS):
         reasons.append("verdict_contradicts_check")

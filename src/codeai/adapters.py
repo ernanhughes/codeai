@@ -322,6 +322,9 @@ class CheckRequest:
     target: str | None = None
     target_state_hash: str | None = None
     environment_hash: str | None = None
+    # How outcomes map to verdicts, declared before execution so the mapping is
+    # recorded rather than inferred from what came back (see codeai.verification).
+    verdict_policy: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,10 +339,18 @@ class CheckResult:
     stderr: str | None = None
     details: str | None = None
     error: str | None = None
+    # Why a legitimate check could not settle the question. Required when the
+    # verdict is INCONCLUSIVE: an unexplained "I do not know" is not evidence.
+    inconclusive_reason: str | None = None
+    # Which declared mapping the verifier applied, when it applied one.
+    verdict_policy_id: str | None = None
     # Runtime-owned reading before verifier invocation, when target_state_hash
     # was requested. None means no reading was obtained (or none requested).
     # This is not a reading of what the verifier actually consumed, nor a lock.
     observed_target_state_hash: str | None = None
+    # Runtime-owned: what the runtime could establish about the checked subject.
+    # A verifier cannot set this; codeai.verification overwrites it.
+    binding_status: str | None = None
 
 
 class VerificationAdapter(Protocol):

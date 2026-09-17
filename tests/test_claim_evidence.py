@@ -69,7 +69,15 @@ class Verdict:
         self.verdict = verdict
 
     def run(self, request):
-        return CheckResult(check_id=request.check_id, verdict=self.verdict)
+        return CheckResult(
+            check_id=request.check_id,
+            verdict=self.verdict,
+            inconclusive_reason=(
+                "the fixture cannot disambiguate this criterion"
+                if self.verdict == CheckVerdict.INCONCLUSIVE
+                else None
+            ),
+        )
 
 
 def make_runtime(path: Path) -> Runtime:
