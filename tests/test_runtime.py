@@ -3,7 +3,7 @@ from pathlib import Path
 
 from codeai.adapters import ActionRequest, ActionResult, ActionStatus, CheckRequest, CheckVerdict
 from codeai.artifacts import FileArtifactStore
-from codeai.domain import Authority, Capability
+from codeai.domain import Authority, Budget, Capability, Directive
 from codeai.ledger import SQLiteLedger
 from codeai.runtime import Runtime
 from codeai.verifier import LocalCommandVerifier
@@ -36,10 +36,22 @@ class FakeExecutionAdapter:
         )
 
 
-def build_runtime(tmp_path: Path, state: list[str]) -> Runtime:
+def build_runtime(tmp_path: Path, state: list[str], *, grant: Authority | None = None) -> Runtime:
     ledger = SQLiteLedger()
     artifacts = FileArtifactStore(tmp_path / "artifacts", ledger)
-    return Runtime(ledger, artifact_store=artifacts, state_resolver=lambda: state[0])
+    runtime = Runtime(ledger, artifact_store=artifacts, state_resolver=lambda: state[0])
+    # Actions name directive d1, and a named directive is now what authorizes
+    # them, so the fixture records the grant instead of asserting it.
+    runtime.open_directive(
+        Directive(
+            directive_id="d1",
+            objective="fixture",
+            success_criteria=(),
+            budget=Budget(),
+            authority=grant or Authority(frozenset({Capability.EXECUTE})),
+        )
+    )
+    return runtime
 
 
 def allow_execute() -> Authority:
@@ -78,23 +90,31 @@ def test_allowed_action_records_request_and_result(tmp_path: Path):
 
     assert result.status == ActionStatus.SUCCEEDED
     assert adapter.calls == 1
-    assert [event.kind for event in runtime.ledger.read_all()] == [
+    # The fixture's directive registration comes first; the action follows.
+    assert [event.kind for event in runtime.ledger.read_all()][2:] == [
         "action.requested",
+        "action.authorized",  # the grant the record establishes, with its basis
         "action.execution_started",  # committed before the adapter acts
         "action.completed",
     ]
 
 
 def test_denied_action_does_not_execute(tmp_path: Path):
+    # The recorded directive grants READ. The caller passes EXECUTE anyway, and
+    # it makes no difference: the runtime decides from the record.
     state = ["before"]
-    runtime = build_runtime(tmp_path, state)
+    runtime = build_runtime(tmp_path, state, grant=Authority(frozenset({Capability.READ})))
     adapter = FakeExecutionAdapter(state)
 
-    result = runtime.execute_action(request(), authority=deny_execute(), adapter=adapter)
+    result = runtime.execute_action(request(), authority=allow_execute(), adapter=adapter)
 
     assert result.status == ActionStatus.DENIED
     assert "capability denied" in (result.error or "")
     assert adapter.calls == 0
+    refusals = runtime.ledger.events_by_kind(("action.authorization_refused",))
+    assert len(refusals) == 1
+    assert refusals[0].payload["directive_id"] == "d1"
+    assert refusals[0].payload["effective_capabilities"] == ["read"]
 
 
 def test_duplicate_retry_reuses_previous_result(tmp_path: Path):

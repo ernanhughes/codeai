@@ -18,7 +18,8 @@ happened?* — an adapter can fail after writing. The ordering that makes the
 distinction decidable is:
 
     action.requested
-          -> authority and precondition checks
+    action.authorized             (the grant the record establishes; Chapter 20)
+          -> precondition check
     action.execution_started      (committed before adapter.execute)
           -> the adapter acts
     action.completed              (result plus the runtime's own observation)
@@ -187,6 +188,10 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
     requested = next((e for e in action_events if e.kind == "action.requested"), None)
     if requested is None:
         return None
+    authorized = next((e for e in action_events if e.kind == "action.authorized"), None)
+    auth_refused = next(
+        (e for e in action_events if e.kind == "action.authorization_refused"), None
+    )
     started = next((e for e in action_events if e.kind == "action.execution_started"), None)
     completed = next((e for e in action_events if e.kind == "action.completed"), None)
     refused = next((e for e in action_events if e.kind == "action.replay_refused"), None)
@@ -282,6 +287,14 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
             next_operation=ActionNextOperation.NONE.value,
             reason="same key, different operation: refused before any effect",
         )
+    elif auth_refused is not None:
+        state = _replace(
+            base,
+            stage="authorization_refused",
+            effect_state=EffectState.NONE.value,
+            next_operation=ActionNextOperation.NONE.value,
+            reason="authority refused the request before the adapter could be invoked",
+        )
     elif started is not None:
         state = _replace(
             base,
@@ -290,6 +303,14 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
             next_operation=ActionNextOperation.RECONCILE_EFFECT.value,
             duplicate_effect_risk=True,
             reason="execution began with no completion recorded; the effect may have happened",
+        )
+    elif authorized is not None:
+        state = _replace(
+            base,
+            stage="authorized",
+            effect_state=EffectState.NONE.value,
+            next_operation=ActionNextOperation.START_ACTION.value,
+            reason="authorized, but execution never started, so no effect was possible",
         )
     elif marks_execution:
         state = _replace(

@@ -105,6 +105,14 @@ from .rendering import (
     prepared_input_text,
     render_context,
 )
+from .authority import (
+    AUTHORITY_RESOLUTION_V1,
+    AuthorizationDecision,
+    DirectiveAuthorityStanding,
+    resolve_directive_authority,
+    standing_from_caller,
+)
+from .authority import authorize as _authorize
 from .actions import (
     ACTION_RECOVERY_V1,
     ActionWorkState,
@@ -207,21 +215,46 @@ class Runtime:
         """Record a directive; declared children must narrow a recorded parent.
 
         This validates registration, not caller identity or action authority.
-        Refusal raises before appending. Direct ledger writes remain outside
-        this application boundary.
+        A refusal is appended before it is raised, so a later reader can tell
+        "nobody attempted this" from "someone attempted this and was refused".
+        Direct ledger writes remain outside this application boundary.
         """
+        requested_event = Event.create(
+            stream_id=directive.directive_id,
+            kind="directive.registration_requested",
+            actor_id=actor_id,
+            payload={
+                "directive_id": directive.directive_id,
+                "parent_directive_id": directive.parent_directive_id,
+                "capabilities": sorted(str(c) for c in directive.authority.capabilities),
+                "budget": asdict(directive.budget),
+                "version": AUTHORITY_RESOLUTION_V1,
+            },
+            correlation_id=directive.directive_id,
+        )
+        self.ledger.append(requested_event)
+
         parent_event = None
         if directive.parent_directive_id is not None:
             recorded = list(self.ledger.events_by_kind(("directive.opened",)))
             if any(e.stream_id == directive.directive_id for e in recorded):
-                raise ValueError("child directive id is already registered")
+                self._refuse_registration(
+                    directive, actor_id, requested_event, "child directive id is already registered"
+                )
             if directive.directive_id == directive.parent_directive_id:
-                raise ValueError("child directive cannot be its own parent")
+                self._refuse_registration(
+                    directive, actor_id, requested_event, "child directive cannot be its own parent"
+                )
             parents = [
                 e for e in recorded if e.stream_id == directive.parent_directive_id
             ]
             if len(parents) != 1:
-                raise ValueError("child directive requires one unambiguous recorded parent")
+                self._refuse_registration(
+                    directive,
+                    actor_id,
+                    requested_event,
+                    "child directive requires one unambiguous recorded parent",
+                )
             parent_event = parents[0]
             payload = parent_event.payload
             parent = Directive(
@@ -234,7 +267,17 @@ class Runtime:
                 )),
                 parent_directive_id=payload.get("parent_directive_id"),
             )
-            parent.validate_child(directive)
+            try:
+                parent.validate_child(directive)
+            except ValueError as exc:
+                self._refuse_registration(
+                    directive,
+                    actor_id,
+                    requested_event,
+                    str(exc),
+                    parent_event_id=parent_event.event_id,
+                    parent_capabilities=sorted(str(c) for c in parent.authority.capabilities),
+                )
         event = Event.create(
             stream_id=directive.directive_id,
             kind="directive.opened",
@@ -245,6 +288,43 @@ class Runtime:
         )
         self.ledger.append(event)
         return event
+
+    def _refuse_registration(
+        self,
+        directive: Directive,
+        actor_id: str,
+        requested_event: Event,
+        reason: str,
+        *,
+        parent_event_id: str | None = None,
+        parent_capabilities: list[str] | None = None,
+    ) -> None:
+        """Append the refusal, then raise. An attempt that was refused is evidence."""
+        self.ledger.append(
+            Event.create(
+                stream_id=directive.directive_id,
+                kind="directive.registration_refused",
+                actor_id=actor_id,
+                payload={
+                    "directive_id": directive.directive_id,
+                    "parent_directive_id": directive.parent_directive_id,
+                    "requested_capabilities": sorted(
+                        str(c) for c in directive.authority.capabilities
+                    ),
+                    "parent_capabilities": parent_capabilities,
+                    "reason": reason,
+                    "basis_event_ids": [
+                        event_id
+                        for event_id in (requested_event.event_id, parent_event_id)
+                        if event_id
+                    ],
+                    "version": AUTHORITY_RESOLUTION_V1,
+                },
+                causation_id=requested_event.event_id,
+                correlation_id=directive.directive_id,
+            )
+        )
+        raise ValueError(reason)
 
     def create_task(self, task: Task, *, actor_id: str = "runtime") -> Event:
         event = Event.create(
@@ -261,8 +341,8 @@ class Runtime:
         self,
         request: ActionRequest,
         *,
-        authority: Authority,
         adapter: ExecutionAdapter,
+        authority: Authority | None = None,
     ) -> ActionResult:
         request_event = Event.create(
             stream_id=request.action_id,
@@ -276,16 +356,53 @@ class Runtime:
         )
         self.ledger.append(request_event)
 
+        # Authority is resolved from the record and decided before anything is
+        # disclosed: a caller without a current grant learns only the denial,
+        # never that an operation under this key exists.
+        decision = self.authorize_action(request, caller_authority=authority)
+        if not decision.granted:
+            self.ledger.append(
+                Event.create(
+                    stream_id=request.action_id,
+                    kind="action.authorization_refused",
+                    actor_id=request.effective_requester(),
+                    payload={"action_id": request.action_id, **decision.basis_payload()},
+                    causation_id=request_event.event_id,
+                    correlation_id=request.task_id,
+                )
+            )
+            observed_state = self._current_state_hash()
+            refused = ActionResult(
+                action_id=request.action_id,
+                status=ActionStatus.DENIED,
+                started_at=now_utc(),
+                completed_at=now_utc(),
+                resulting_state_hash=observed_state,
+                observed_state_hash=observed_state,
+                error=decision.reason,
+            )
+            self._append_action_result_event(refused, actor_id=request.actor_id)
+            return refused
+
+        self.ledger.append(
+            Event.create(
+                stream_id=request.action_id,
+                kind="action.authorized",
+                actor_id=request.effective_requester(),
+                payload={"action_id": request.action_id, **decision.basis_payload()},
+                causation_id=request_event.event_id,
+                correlation_id=request.task_id,
+            )
+        )
+
         existing = self._find_action_result(request.idempotency_key)
         if existing is not None:
-            return self._replay_action_result(
-                request, existing, request_event, authority=authority
-            )
+            # The replay is disclosed under its own authorization basis, which
+            # need not be the basis the original effect ran under.
+            return self._replay_action_result(request, existing, request_event)
 
         started_at = now_utc()
         try:
-            capability = Capability(str(request.capability))
-            self.policy.require(authority, capability)
             current_state = self._current_state_hash()
             if (
                 request.precondition_hash is not None
@@ -323,13 +440,11 @@ class Runtime:
                 completed_at=now_utc(),
                 resulting_state_hash=observed_state,
             )
-        except (AuthorityDenied, PreconditionMismatch) as exc:
+        except PreconditionMismatch as exc:
             observed_state = self._current_state_hash()
             finalized = ActionResult(
                 action_id=request.action_id,
-                status=ActionStatus.DENIED
-                if isinstance(exc, AuthorityDenied)
-                else ActionStatus.FAILED,
+                status=ActionStatus.FAILED,
                 started_at=started_at,
                 completed_at=now_utc(),
                 resulting_state_hash=observed_state,
@@ -484,6 +599,25 @@ class Runtime:
     def work_state(self, task_id: str) -> WorkState:
         """Project attempted, failed, unresolved and safe-next work; appends nothing."""
         return project_work_state(self, task_id)
+
+    def directive_authority(self, directive_id: str | None) -> DirectiveAuthorityStanding:
+        """Resolve a directive's effective grant from the recorded chain; appends nothing."""
+        return resolve_directive_authority(self.ledger.read_all(), directive_id)
+
+    def authorize_action(
+        self, request: ActionRequest, *, caller_authority: Authority | None = None
+    ) -> AuthorizationDecision:
+        """Decide one action's capability against the grant the record establishes.
+
+        A request that names a directive is decided from that directive's chain,
+        whatever the caller passed. A request that names none falls back to the
+        caller's grant, recorded as caller-supplied rather than as derived.
+        """
+        if request.directive_id is not None:
+            standing = self.directive_authority(request.directive_id)
+        else:
+            standing = standing_from_caller(caller_authority)
+        return _authorize(standing, request.capability)
 
     def action_state(self, action_id: str) -> ActionWorkState | None:
         """Classify one action: result status, effect state, and what is safe next."""
@@ -2636,8 +2770,6 @@ class Runtime:
         request: ActionRequest,
         existing: ActionResult,
         request_event: Event,
-        *,
-        authority: Authority,
     ) -> ActionResult:
         """Return a recorded completion instead of performing a new effect.
 
@@ -2647,23 +2779,6 @@ class Runtime:
         beyond the denial; identity is checked second so a colliding key can
         never silently convert one operation into another.
         """
-        started_at = now_utc()
-        try:
-            capability = Capability(str(request.capability))
-            self.policy.require(authority, capability)
-        except AuthorityDenied as exc:
-            observed_state = self._current_state_hash()
-            denied = ActionResult(
-                action_id=request.action_id,
-                status=ActionStatus.DENIED,
-                started_at=started_at,
-                completed_at=now_utc(),
-                resulting_state_hash=observed_state,
-                observed_state_hash=observed_state,
-                error=str(exc),
-            )
-            self._append_action_result_event(denied, actor_id=request.actor_id)
-            return denied
         self._check_action_replay_fingerprint(request, existing, request_event)
         replay = replace(
             existing,

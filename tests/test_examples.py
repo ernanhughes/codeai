@@ -32,3 +32,18 @@ def test_ch22_action_recovery_example(capsys):
     # Later evidence settles the effect without rewriting the reported status.
     assert summary["effect_after_reconciliation"] == "observed"
     assert summary["result_status_after_reconciliation"] == "failed"
+
+
+def test_ch20_authority_example(capsys):
+    summary = load("ch20_authority.py").main()
+    capsys.readouterr()
+
+    assert summary["chain"] == ["review-child", "review-root"]
+    assert summary["effective"] == ["write"]
+    assert summary["write"] == "succeeded"
+    assert summary["destructive"] == "denied"
+    # The caller claimed DESTRUCTIVE; the record did not grant it.
+    assert summary["forged"] == "denied"
+    assert summary["worker_calls"] == 1
+    assert summary["grant_source"] == "recorded_directive"
+    assert summary["basis_events"] == 2
