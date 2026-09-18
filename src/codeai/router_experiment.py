@@ -106,7 +106,11 @@ def run(runtime, corpus, oracle, manifest, routers: dict[str, ModelRouter], *,
         elif row["path"] == "D":
             input_value = {"state": case.state}  # structural C baseline
         else:
-            input_value = {"narrative": case.narrative, "irrelevant_history": case.distractor}
+            # Neutral structural name: it says what the material is (history),
+            # not what the experimenter thinks about its relevance. Stratum C
+            # measures resistance to salient-but-irrelevant material, so the
+            # model must infer irrelevance from content, never from the key.
+            input_value = {"narrative": case.narrative, "prior_history": case.distractor}
         # canonical JSON normally sorts keys; order sensitivity uses an explicit list
         # of the same field/value pairs, never extra decision information.
         if row["variant"] == "field_order":

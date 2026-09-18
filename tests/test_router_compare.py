@@ -239,6 +239,39 @@ def test_draft_corpus_status():
         validate_corpus(corpus, freeze=True)
 
 
+def test_model_arm_input_key_is_neutral_about_relevance(tmp_path, monkeypatch):
+    """Experimental inputs may describe structure, never a relevance judgment.
+
+    Stratum C measures resistance to salient-but-irrelevant material, so the
+    distractor must reach model arms under a neutral structural key
+    (``prior_history``). A key such as ``irrelevant_history`` would hand the
+    model the very judgment the experiment exists to measure.
+    """
+    ledger = SQLiteLedger(tmp_path / "ledger.sqlite")
+    store = FileArtifactStore(tmp_path / "artifacts", ledger)
+    runtime = Runtime(ledger, artifact_store=store)
+    actor = ActorRef("test-router", "model", "fake-provider", "gpt-4.1", "fixture-v1")
+    routers = {name: ModelRouter(runtime, fake_with_transport(monkeypatch), actor)
+               for name in ("primary", "alternate")}
+    c = fixture_corpus()
+    o = fixture_oracle(c)
+    run(runtime, c, o, {"status": "TEST_ONLY"}, routers, run_id="neutral-key", synthetic=True)
+    requested = ledger.events_by_kind(("router.requested",))
+    assert requested, "synthetic run must record requested inputs"
+    for event in requested:
+        value = event.payload["input"]
+        # No input anywhere may encode a relevance judgment in its key.
+        assert "irrelevant_history" not in value
+        if event.payload["path"] in ("D",):
+            # Deterministic policy arms decide from frozen flags only.
+            assert set(value) == {"state"}
+        elif "narrative" in value:
+            # Narrative-carrying arms (M-direct, M+D, and D+D which extracts
+            # from the narrative only) name the extra material neutrally.
+            assert set(value) == {"narrative", "prior_history"}
+    ledger._conn.close()
+
+
 def test_a_model_arm_without_usage_is_an_instrumentation_failure(tmp_path, monkeypatch):
     """Absence of accounting evidence is not zero cost.
 

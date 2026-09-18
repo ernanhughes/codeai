@@ -148,3 +148,38 @@ than the version the design named, so a later reader is not misled.
 No case has been executed through any router under this protocol. No provider has been contacted. No
 spend has occurred. `router_compare.py`'s entry point still refuses to run itself, and that has not
 been weakened.
+
+## Correction 2026-09-18 (author): neutral input key for stratum C
+
+Checkpoint A flagged, but did not make, a harness correction: stratum C's distractor reached model
+arms under the key `irrelevant_history`, which tells the model the material is irrelevant and
+weakens the one stratum built to test salience traps. Settled before either adjudicator begins and
+before any freeze, as the review required.
+
+```text
+before    {"narrative": ..., "irrelevant_history": ...}
+after     {"narrative": ..., "prior_history": ...}
+```
+
+Frozen principle: **experimental inputs may describe provenance or structure, but must not encode
+the experimenter's judgment about relevance.** `prior_history` says what the material is, not what
+it is worth. The model must infer irrelevance from content and task state.
+
+Scope of this change, verified:
+
+```text
+harness only        src/codeai/router_experiment.py (one input line + comment)
+corpus              UNCHANGED — router_cases_v1.CANDIDATE.json still
+                    ee3d250ff23321d9aaadc01a00d3b87d0e91bb154089e72a2a471cb96baacd95
+prompts             UNCHANGED — router-prompt-v1 / v1b bytes and hashes identical
+thresholds/arms/    UNCHANGED — repeats, schedules, falsifier, R1 authorization ($0.25),
+budgets             $1.00 ceiling, two-adjudicator rule, epistemic-v3 all untouched
+worksheets          UNCHANGED in case content and corpus hash (regenerated mechanically
+                    to confirm byte-identical)
+tests               + test_model_arm_input_key_is_neutral_about_relevance, which replays
+                    the synthetic harness and refuses any relevance-judging key
+```
+
+`W2-4-corpus-review.md` (Checkpoint A) is a frozen historical record and was not edited to hide
+the old key; this section is its erratum. The instrumentation dry run was re-executed after the
+rename at $0.00; its findings are re-frozen in `W2-4-dryrun-results.json`.
