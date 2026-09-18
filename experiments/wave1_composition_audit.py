@@ -718,8 +718,15 @@ def probe_h_verification_to_claim(stack) -> Probe:
         sorted(e.payload) for e in b.ledger.events_by_kind(("claim.verification_attempted",))
     ][0]
     p.see(f"the claim-side record holds a reference, not a verdict: {trace_payload}")
+    p.see("scope of this classification: the linkage and its admissibility rules are ENFORCED; "
+          "the claim's evidentiary state remains DERIVED from the recorded checks")
     p.classification = "ENFORCED" if attempts and attempts[0].verdict == "ERROR" else "DERIVED"
-    p.note = ("Baseline (f0c730b): the attempt was reconstructable only by scanning every "
+    p.note = ("ENFORCED here means the claim-to-check linkage and the admissibility rules -- an "
+              "unknown claim is refused, one attempt per check, ERROR and INCONCLUSIVE are "
+              "inadmissible as evidence. It does not mean the runtime establishes that any "
+              "evidence is true; the claim's evidentiary state is still derived from the "
+              "authoritative check results. "
+              "Baseline (f0c730b): the attempt was reconstructable only by scanning every "
               "check.requested for the claim id, so 'no negative evidence' and 'no claim-side "
               "trace' were the same thing. After W1-R5 every attempt is navigable from the claim "
               "and carries no verdict of its own: the check stream stays the single source of "

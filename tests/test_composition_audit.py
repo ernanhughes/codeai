@@ -204,6 +204,9 @@ def test_gap_e_repaired_an_errored_verification_is_discoverable_from_the_claim(p
     # A reference, not a second opinion.
     assert "['check_completed_event_id', 'check_id', 'claim_id', 'version']" in observed
     assert probes["H"]["classification"] == "ENFORCED"
+    # ENFORCED is scoped: linkage and admissibility, never the truth of evidence.
+    assert "linkage and its admissibility rules are ENFORCED" in observed
+    assert "evidentiary state remains DERIVED" in observed
 
 
 def test_replay_is_decided_against_the_record_as_it_stands(probes):

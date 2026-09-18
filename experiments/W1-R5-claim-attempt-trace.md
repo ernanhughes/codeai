@@ -94,6 +94,18 @@ H  verification -> claim evidence     DERIVED  ->  ENFORCED
 
 Nothing else moved.
 
+**What ENFORCED means on this row, precisely:**
+
+```text
+verification -> claim linkage / admissibility    ENFORCED
+claim evidentiary state                          DERIVED from the recorded checks
+```
+
+The runtime enforces that every attempt is linked, that an unknown claim is refused rather than
+linked, that a check yields one attempt, and that ERROR and INCONCLUSIVE are inadmissible as
+evidence. It does not establish that any evidence is *true*. A claim's status and evidence class
+remain a projection over the authoritative check results, exactly as before this repair.
+
 ## What this repair does not do
 
 1. **It does not change claim semantics.** What moves a claim is exactly what moved it before.
