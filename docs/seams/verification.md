@@ -96,6 +96,23 @@ reading it as if it could establish anything.
 The limit is the same shape as the state binding's: **this establishes what the check was given,
 never what it read.** Details: `experiments/W1-R3-artifact-binding.md`.
 
+## Repair W1-R5: every attempt is navigable from the claim
+
+The audit (gap 5) found that an ERROR left no claim-side trace, so "no evidence was produced" and "no
+attempt is discoverable" were the same fact. `claim.verification_attempted` now records the relation
+-- claim id, check id, the completion event, and nothing else:
+
+```text
+claim
+  |- verification attempts    PASS / FAIL / INCONCLUSIVE / ERROR   all visible
+  `- evidentiary effect       PASS may support, FAIL may refute; the others move nothing
+```
+
+It carries no verdict of its own, so the check stream stays the single source of truth and the two can
+never disagree. `verification_attempts_for_claim` resolves each check at read time. An unknown claim
+is refused rather than linked, and `claim.check_inconclusive` -- which did copy a reason onto the
+claim side -- is gone. Details: `experiments/W1-R5-claim-attempt-trace.md`.
+
 ## Recording shape
 
 The event flow is unchanged — `check.requested` → binding → verifier → `check.completed` — and
