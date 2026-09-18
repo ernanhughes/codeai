@@ -1,0 +1,324 @@
+{
+  "subject": {
+    "commit": "4e405d9bbb7634e9f368439b5743054fd7dda55b",
+    "branch": "seam/acceptance-basis",
+    "dirty": false,
+    "runtime_commit": "4e405d9bbb7634e9f368439b5743054fd7dda55b",
+    "python": "3.13.15"
+  },
+  "protocol": "experiments/W1-composition-prereg.md",
+  "happy_path": {
+    "trace": [
+      {
+        "step": "directive recorded",
+        "chain": [
+          "d-child",
+          "d-root"
+        ],
+        "effective": [
+          "accept",
+          "write"
+        ]
+      },
+      {
+        "step": "decision 1",
+        "operation": "CALL",
+        "reason": "task requests independent proposals",
+        "policy": "epistemic-v3"
+      },
+      {
+        "step": "recorded call",
+        "call_id": "21fd3bd8-e3e2-4dae-ab3e-479fbb5cdaff",
+        "artifact_sha256": "35f79d8b90a3c987"
+      },
+      {
+        "step": "decision 2",
+        "operation": "CHECK",
+        "reason": "required deterministic verification exists"
+      },
+      {
+        "step": "effect",
+        "status": "succeeded",
+        "effect_state": "observed",
+        "next_operation": "none",
+        "adapter_calls": 1
+      },
+      {
+        "step": "verification",
+        "verdict": "PASS",
+        "binding": "bound",
+        "artifact_binding": "bound",
+        "observed": "1e3f91e171d15130"
+      },
+      {
+        "step": "decision 3",
+        "operation": "STOP",
+        "reason": "no epistemic operation required"
+      },
+      {
+        "step": "acceptance",
+        "outcome": "completed",
+        "acceptance_authority": "resolved from the record: granted"
+      },
+      {
+        "step": "decision 4",
+        "operation": "STOP",
+        "reason": "the process is already complete"
+      }
+    ],
+    "event_count": 29,
+    "kinds": [
+      "action.authorized",
+      "action.completed",
+      "action.execution_started",
+      "action.requested",
+      "attempt.completed",
+      "attempt.interpreted",
+      "attempt.observed",
+      "attempt.retry_decided",
+      "attempt.started",
+      "call.completed",
+      "call.manifest",
+      "call.requested",
+      "call.status_decided",
+      "check.completed",
+      "check.requested",
+      "directive.opened",
+      "directive.registration_requested",
+      "operation.governance_recorded",
+      "scheduler.decision_recorded",
+      "task.accepted",
+      "task.completed",
+      "task.created"
+    ],
+    "reopen_identical": true,
+    "reprojected_status": "completed",
+    "reprojected_decision": "STOP"
+  },
+  "probes": [
+    {
+      "probe_id": "A",
+      "joint": "directive -> action authority",
+      "question": "Can caller-supplied authority widen the recorded grant?",
+      "expected_property": "an action the record does not grant must not execute",
+      "observed": [
+        "record grants READ only; caller passed WRITE+DESTRUCTIVE -> denied",
+        "adapter invocations: 0",
+        "events: ['action.requested', 'action.authorization_refused', 'action.completed']",
+        "refusal carries basis: ['action_id', 'basis_event_ids', 'capability', 'directive_id', 'effective_capabilities', 'effective_directive_id', 'grant_chain', 'grant_source', 'reason', 'status', 'supersession_chain', 'version']"
+      ],
+      "classification": "ENFORCED",
+      "note": ""
+    },
+    {
+      "probe_id": "B",
+      "joint": "directive -> acceptance authority",
+      "question": "Can a caller accept a task when the recorded directive grants no ACCEPT?",
+      "expected_property": "acceptance authority should come from the same recorded chain as action authority",
+      "observed": [
+        "recorded grant: ['write']; allows accept: False",
+        "caller passed Authority({ACCEPT}) against a record that grants none -> rejected: acceptance_not_granted:d-root",
+        "task completion projects: incomplete",
+        "task.accepted events: 0; durable refusals: 1",
+        "refusal names the directive it resolved: d-root",
+        "refusal basis status: denied",
+        "what the caller claimed, recorded as a claim: ['accept']"
+      ],
+      "classification": "ENFORCED",
+      "note": "Baseline (f0c730b): the grant behind an acceptance was the caller's argument. After W1-R2 it is resolved from the task's own recorded directive chain, and what the caller passes is recorded as a claim that changes nothing."
+    },
+    {
+      "probe_id": "C",
+      "joint": "decision -> execution",
+      "question": "Does the runtime enforce that the executed operation is the decided one?",
+      "expected_property": "a governed operation must match its decision; an ungoverned one must say so",
+      "observed": [
+        "recorded decision: CHECK (32f128a6...)",
+        "action claiming that CHECK decision -> failed, adapter calls 0",
+        "action claiming scheduler governance with no decision -> failed, adapter calls 0",
+        "action claiming nothing -> succeeded, adapter calls 1, recorded as ungoverned/external_request",
+        "a decision taken now says: CHECK",
+        "check under that fresh CHECK decision -> PASS",
+        "the first decision, after the state moved -> ERROR (governance refused: the process state has moved sinc...)"
+      ],
+      "classification": "ENFORCED",
+      "note": "Baseline (f0c730b): the decision and the effect coexisted with no link in either direction. After W1-R4 an operation that claims a decision is checked against it for task, operation class and freshness, and an operation that claims none is recorded as external rather than silently passing for governed. The scheduler still cannot select ACTION, so no effect can be scheduler-governed: that is the book's position, now enforced rather than assumed."
+    },
+    {
+      "probe_id": "D",
+      "joint": "action request -> effect",
+      "question": "Does a worker's report of success establish that the effect happened?",
+      "expected_property": "the worker's report and the runtime's observation must stay separable",
+      "observed": [
+        "worker reported succeeded and changed nothing: state hash moved = False",
+        "projected effect state: unknown (basis record)",
+        "the projection's stated reason: 'reported success while the observed scope did not change; the record cannot say whether the effect happened outside that scope or not at all'",
+        "runtime's own readings: pre be2fe827c17a, recorded resulting be2fe827c17a -- identical: True",
+        "a check of the intended post-condition: FAIL (binding bound)",
+        "effect_state trusts the report alone: False"
+      ],
+      "classification": "DERIVED",
+      "note": "Baseline (f0c730b): seam 1 separated result status from effect state everywhere except the SUCCEEDED branch, where OBSERVED came from the worker's report while the runtime held two identical readings it never compared. After W1-R1 the effect state is derived from those readings; the report itself is still RECORDED, which is correct -- it is the actor's claim, and it is kept as one."
+    },
+    {
+      "probe_id": "E",
+      "joint": "effect -> recovery / reconciliation",
+      "question": "Does effect-unknown survive composition without becoming retry-safe?",
+      "expected_property": "FAILED != INEFFECTUAL, and unknown must not imply permission to act again",
+      "observed": [
+        "reported status failed; effect state unknown; next operation reconcile_effect",
+        "open effects for the task: ['a1']",
+        "scheduler with an unresolved effect: ASK_HUMAN (unresolved_effect_requires_reconciliation)",
+        "same-key retry -> failed; adapter invocations total 1",
+        "precondition mismatch -> effect none, next fix_inputs",
+        "after reconciliation: effect observed, reported status still failed",
+        "scheduler after reconciliation: CALL"
+      ],
+      "classification": "ENFORCED",
+      "note": ""
+    },
+    {
+      "probe_id": "F",
+      "joint": "observed state -> verification binding",
+      "question": "Can a verifier decide, or misreport, what it was checking?",
+      "expected_property": "binding failure is ERROR; the runtime's reading is the only account of the subject",
+      "observed": [
+        "BOUND: verdict PASS, binding bound, recorded observation be2fe827c17a... (verifier claimed 'whatever-I-like')",
+        "UNBOUND: verdict PASS, binding unbound, observation None",
+        "MISMATCH: verdict ERROR, binding mismatch, verifier invocations so far 2",
+        "UNAVAILABLE: verdict ERROR, binding unavailable",
+        "binding failure never produced INCONCLUSIVE: True",
+        "binding is durable in the record: ['observed_state_hash', 'reason', 'requested_state_hash', 'status', 'version']"
+      ],
+      "classification": "ENFORCED",
+      "note": "The binding is a reading, not a lock: nothing holds the state still during the run."
+    },
+    {
+      "probe_id": "G",
+      "joint": "verification command -> verdict semantics",
+      "question": "Do all four verdicts survive composition without collapsing?",
+      "expected_property": "PASS/FAIL/INCONCLUSIVE/ERROR stay four different answers",
+      "observed": [
+        "k-pass: PASS -- exit 0",
+        "k-fail: FAIL -- exit 1",
+        "k-maybe: INCONCLUSIVE -- exit code 2 is declared inconclusive by exit-code-v1: cannot read as prose",
+        "k-unmapped: ERROR -- exit code 7 is not mapped by exit-code-v1: pass=[0] fail=[1] inconclusive=[2]",
+        "INCONCLUSIVE with no reason -> ERROR (inconclusive result carries no reason)"
+      ],
+      "classification": "ENFORCED",
+      "note": ""
+    },
+    {
+      "probe_id": "H",
+      "joint": "verification -> claim evidence",
+      "question": "Is an attempted-and-errored verification discoverable from the claim?",
+      "expected_property": "ERROR must not refute, but the attempt must not become invisible either",
+      "observed": [
+        "PASS -> E3_REPRODUCED; FAIL -> refuted",
+        "INCONCLUSIVE -> status asserted, durable attempts 1",
+        "ERROR (exit code 7 is not mapped by exit-code-v...) -> status asserted",
+        "attempts discoverable from the errored claim: [('k-error', 'ERROR', False)]",
+        "every outcome is navigable from its claim: {'c-pass': [('k-pass', 'PASS')], 'c-fail': [('k-fail', 'FAIL')], 'c-maybe': [('k-maybe', 'INCONCLUSIVE')], 'c-error': [('k-error', 'ERROR')]}",
+        "and only PASS/FAIL bear on it: {'c-pass': [True], 'c-fail': [True], 'c-maybe': [False], 'c-error': [False]}",
+        "the claim-side record holds a reference, not a verdict: ['check_completed_event_id', 'check_id', 'claim_id', 'version']",
+        "scope of this classification: the linkage and its admissibility rules are ENFORCED; the claim's evidentiary state remains DERIVED from the recorded checks"
+      ],
+      "classification": "ENFORCED",
+      "note": "ENFORCED here means the claim-to-check linkage and the admissibility rules -- an unknown claim is refused, one attempt per check, ERROR and INCONCLUSIVE are inadmissible as evidence. It does not mean the runtime establishes that any evidence is true; the claim's evidentiary state is still derived from the authoritative check results. Baseline (f0c730b): the attempt was reconstructable only by scanning every check.requested for the claim id, so 'no negative evidence' and 'no claim-side trace' were the same thing. After W1-R5 every attempt is navigable from the claim and carries no verdict of its own: the check stream stays the single source of truth for what was found."
+    },
+    {
+      "probe_id": "I",
+      "joint": "verification -> acceptance",
+      "question": "Which verification records can acceptance rely on, and are they bound to the bytes?",
+      "expected_property": "acceptance must not rest on a stale, unbound, inconclusive or errored check",
+      "observed": [
+        "PASS on a different artifact -> rejected: check_wrong_artifact:k-other",
+        "INCONCLUSIVE on the right artifact -> rejected: check_not_passed:k-maybe:INCONCLUSIVE",
+        "ERROR on the right artifact -> rejected: check_not_passed:k-err:ERROR",
+        "PASS with no artifact label -> rejected: check_wrong_artifact:k-unlabelled",
+        "PASS labelled with the accepted artifact -> completed",
+        "the artifact identity acceptance rests on: status=bound, materialized=True",
+        "resolved digest: 35f79d8b90a3c987..."
+      ],
+      "classification": "ENFORCED",
+      "note": "Baseline (f0c730b): acceptance matched a caller-written label against another label. After W1-R3 the runtime resolves the artifact from the store, verifies its digest and materializes it for the check, and acceptance compares that reading."
+    },
+    {
+      "probe_id": "J",
+      "joint": "acceptance -> completion",
+      "question": "Can completion occur without a valid acceptance path?",
+      "expected_property": "model completed != check passed != accepted != completed",
+      "observed": [
+        "after a succeeded call, completion projects: incomplete",
+        "after a PASS, completion projects: incomplete",
+        "after a hand-appended task.completed: incomplete",
+        "scheduler still says: CHECK"
+      ],
+      "classification": "ENFORCED",
+      "note": ""
+    },
+    {
+      "probe_id": "K",
+      "joint": "completion / replay -> current authority",
+      "question": "Which authority governs a replay of a previously authorized operation?",
+      "expected_property": "a past success must not authorize a future replay by itself",
+      "observed": [
+        "authorized effect under d-child: succeeded, adapter calls 1",
+        "same-key replay under the same grant: succeeded, adapter calls 1",
+        "attempt to re-register d-child with a narrower grant -> ValueError: child directive id is already registered",
+        "resolved standing now: resolvable=True, reason=resolved from 2 recorded directive(s)",
+        "same-key replay after the attempted narrowing: succeeded (None)",
+        "adapter calls total: 1",
+        "replaying the same key while asking for a capability the child lacks: denied"
+      ],
+      "classification": "ENFORCED",
+      "note": "Replay is authorized against the record as it stands now, not against the grant the original effect ran under. Revocation itself is absent: a directive cannot be narrowed, only invalidated by a second registration."
+    },
+    {
+      "probe_id": "L",
+      "joint": "durable state -> next-operation decision",
+      "question": "Is every decision derived from durable facts, and is every decision recorded?",
+      "expected_property": "recomputable != recorded != causally binding",
+      "observed": [
+        "task-level API: CHECK, decisions recorded: 1",
+        "raw SchedulerInput API: STOP from caller-supplied flags",
+        "decisions recorded after that call: 1",
+        "projection contradicts the fabricated flags: check_required=True"
+      ],
+      "classification": "DERIVED",
+      "note": "The task-level path projects and records. The raw path remains a pure function a caller may call with any flags; it records nothing, so it creates no false basis, but it also means a decision can exist outside the record."
+    },
+    {
+      "probe_id": "M",
+      "joint": "check -> artifact identity",
+      "question": "Is the artifact a check claims to have examined established, or merely labelled?",
+      "expected_property": "acceptance should rest on a check that demonstrably examined those bytes",
+      "observed": [
+        "check command: 'sys.exit(0)' -- it never opened the artifact",
+        "check request labelled target=artifact:sha256:35f79d8b90a3...",
+        "acceptance citing that check -> rejected: check_wrong_artifact:k-blind, check_not_passed:k-blind:ERROR",
+        "the check's own verdict: ERROR",
+        "artifact binding: unconsumed -- the command never references {artifact}, so the artifact it claims to check was never given to it"
+      ],
+      "classification": "ENFORCED",
+      "note": "Baseline (f0c730b): a command that never opened the artifact carried its label, passed, and completed an acceptance. After W1-R3 a command check that never references the materialized artifact is UNCONSUMED, which is ERROR rather than a verdict. What the command does with the bytes it is given remains its own business."
+    },
+    {
+      "probe_id": "N",
+      "joint": "scheduler human gate -> acceptance authority",
+      "question": "When the scheduler asks for a human, can a human answer?",
+      "expected_property": "ASK_HUMAN should name a gate somebody can pass",
+      "observed": [
+        "scheduler: ASK_HUMAN (next effect requires human authority)",
+        "a human accepting without changing authority -> rejected: acceptance_not_granted:d-root",
+        "the task waits at: ASK_HUMAN",
+        "after a recorded authority transition: accept granted = True, effective directive = d-root-accept",
+        "the same acceptance, under the ordinary rule -> completed",
+        "the task now ends at: STOP",
+        "the gate opened by changing authority, not by bypassing it"
+      ],
+      "classification": "ENFORCED",
+      "note": "Baseline (f0c730b, and through W1-R5): the durable process reached a state from which completion was unauthorized -- the correct result -- with no legal transition out of it. W1-E1 adds one: a recorded authority transition supersedes the directive, the projection moves, and acceptance is then enforced the ordinary way. Human intervention changes authority; it does not bypass it. The actor remains attribution, never authentication."
+    }
+  ]
+}
