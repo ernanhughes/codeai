@@ -34,6 +34,28 @@ An action that names no directive falls back to the caller-supplied grant. That
 is recorded as such (``caller_supplied``) rather than dressed up as derived
 authority, and it stays a named limitation: name a directive and the runtime
 stops trusting the caller.
+
+Authority also changes over time, and that is a different relationship from
+delegation. Both live here, and they must not be confused:
+
+    delegation            parent -> child
+                          effective(child) is a subset of effective(parent)
+                          a widening child is invalid, always
+
+    authority transition  old directive -> superseding directive
+                          may add, remove or otherwise alter authority, because
+                          it records a new external decision rather than a
+                          delegated child claiming powers its parent lacked
+
+Directives are immutable. A transition records a successor and leaves the
+predecessor exactly as it was, so the history stays honest: what was true at T1
+is still readable at T3. Resolution follows the supersession chain first, then
+intersects the delegation chain of whichever directive is currently effective.
+
+What a transition establishes is narrow: *an explicit external authority change,
+attributed to this actor, entered the durable process at this point*. It does not
+establish that the actor was entitled to make it. Attribution is not
+authentication, here as everywhere else.
 """
 
 from __future__ import annotations
@@ -45,11 +67,28 @@ from .domain import Authority, Capability
 from .ledger import Event
 
 AUTHORITY_RESOLUTION_V1 = "authority-resolution-v1"
+AUTHORITY_TRANSITION_V1 = "authority-transition-v1"
+
+TRANSITIONED = "authority.transitioned"
+TRANSITION_REFUSED = "authority.transition_refused"
 
 
 class GrantSource(StrEnum):
     RECORDED_DIRECTIVE = "recorded_directive"
     CALLER_SUPPLIED = "caller_supplied"
+
+
+class TransitionSource(StrEnum):
+    """Who decided that authority should change. Attribution, not authentication."""
+
+    HUMAN_INTERVENTION = "human_intervention"
+    EXTERNAL_DECISION = "external_decision"
+
+
+class AuthorityTransitionRefused(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"authority transition refused: {reason}")
 
 
 class AuthorizationStatus(StrEnum):
@@ -79,6 +118,10 @@ class DirectiveAuthorityStanding:
     basis_event_ids: tuple[str, ...]
     reason: str
     version: str = AUTHORITY_RESOLUTION_V1
+    # The directive actually resolved, and how the record got there from the one
+    # that was named. Empty when nothing has superseded it.
+    effective_directive_id: str | None = None
+    supersession_chain: tuple[str, ...] = ()
 
     def allows(self, capability: str | Capability) -> bool:
         return self.resolvable and str(Capability(str(capability))) in self.effective_capabilities
@@ -117,6 +160,8 @@ class AuthorizationDecision:
                 for link in self.standing.grant_chain
             ],
             "basis_event_ids": list(self.standing.basis_event_ids),
+            "effective_directive_id": self.standing.effective_directive_id,
+            "supersession_chain": list(self.standing.supersession_chain),
             "version": AUTHORITY_RESOLUTION_V1,
         }
 
@@ -135,10 +180,59 @@ def _capabilities_of(event: Event) -> tuple[str, ...]:
     return tuple(sorted(str(value) for value in values))
 
 
+def resolve_supersession(
+    events: tuple[Event, ...], directive_id: str
+) -> tuple[str | None, tuple[str, ...], tuple[str, ...], str | None]:
+    """Follow authority transitions to whichever directive is effective now.
+
+    Returns (effective_id, chain, basis_event_ids, refusal_reason). A directive
+    with two recorded successors is refused rather than silently resolved to one
+    of them: an ambiguous authority epoch is not an authority.
+    """
+    successors: dict[str, list[Event]] = {}
+    for event in events:
+        if event.kind == TRANSITIONED:
+            previous = str(event.payload.get("previous_directive_id") or "")
+            successors.setdefault(previous, []).append(event)
+
+    chain = [str(directive_id)]
+    basis: list[str] = []
+    seen = {str(directive_id)}
+    current = str(directive_id)
+    while current in successors:
+        recorded = successors[current]
+        if len(recorded) > 1:
+            return (
+                None,
+                tuple(chain),
+                tuple(basis),
+                f"directive {current} has {len(recorded)} recorded successors; "
+                f"the effective authority is ambiguous",
+            )
+        event = recorded[0]
+        nxt = str(event.payload.get("new_directive_id") or "")
+        if nxt in seen:
+            return (
+                None,
+                tuple(chain),
+                tuple(basis),
+                f"the supersession chain revisits {nxt}: it is a cycle, not a history",
+            )
+        basis.append(event.event_id)
+        seen.add(nxt)
+        chain.append(nxt)
+        current = nxt
+    return current, tuple(chain), tuple(basis), None
+
+
 def resolve_directive_authority(
     events: tuple[Event, ...], directive_id: str | None
 ) -> DirectiveAuthorityStanding:
-    """Walk the recorded directive chain and intersect the grants. Appends nothing."""
+    """Resolve the currently effective grant for a directive. Appends nothing.
+
+    Supersession first (which directive is in force now), then delegation (what
+    that directive and its recorded parents jointly allow).
+    """
     if directive_id is None:
         return DirectiveAuthorityStanding(
             directive_id=None,
@@ -150,10 +244,29 @@ def resolve_directive_authority(
             reason="the request names no directive, so no recorded grant can be resolved",
         )
 
+    named = str(directive_id)
+    effective_id, supersession, supersession_basis, refusal = resolve_supersession(events, named)
+    if refusal is not None:
+        return DirectiveAuthorityStanding(
+            directive_id=named,
+            source=GrantSource.RECORDED_DIRECTIVE.value,
+            resolvable=False,
+            effective_capabilities=(),
+            grant_chain=(),
+            basis_event_ids=supersession_basis,
+            reason=refusal,
+            effective_directive_id=None,
+            supersession_chain=supersession,
+        )
+    superseded = {
+        "effective_directive_id": effective_id,
+        "supersession_chain": supersession,
+    }
+
     by_id = _directive_events(events)
     chain: list[GrantLink] = []
     seen: set[str] = set()
-    current: str | None = str(directive_id)
+    current: str | None = effective_id
     effective: set[str] | None = None
 
     while current is not None:
@@ -170,7 +283,8 @@ def resolve_directive_authority(
                 resolvable=False,
                 effective_capabilities=(),
                 grant_chain=tuple(chain),
-                basis_event_ids=tuple(link.event_id for link in chain),
+                basis_event_ids=tuple(link.event_id for link in chain) + supersession_basis,
+                **superseded,
                 reason=reason,
             )
         if len(recorded) > 1:
@@ -180,7 +294,8 @@ def resolve_directive_authority(
                 resolvable=False,
                 effective_capabilities=(),
                 grant_chain=tuple(chain),
-                basis_event_ids=tuple(link.event_id for link in chain),
+                basis_event_ids=tuple(link.event_id for link in chain) + supersession_basis,
+                **superseded,
                 reason=f"directive {current} has more than one recorded registration",
             )
         if current in seen:
@@ -190,7 +305,8 @@ def resolve_directive_authority(
                 resolvable=False,
                 effective_capabilities=(),
                 grant_chain=tuple(chain),
-                basis_event_ids=tuple(link.event_id for link in chain),
+                basis_event_ids=tuple(link.event_id for link in chain) + supersession_basis,
+                **superseded,
                 reason=f"the recorded chain revisits {current}: it is a cycle, not a hierarchy",
             )
         seen.add(current)
@@ -218,7 +334,8 @@ def resolve_directive_authority(
                 resolvable=False,
                 effective_capabilities=(),
                 grant_chain=tuple(chain),
-                basis_event_ids=tuple(link.event_id for link in chain),
+                basis_event_ids=tuple(link.event_id for link in chain) + supersession_basis,
+                **superseded,
                 reason=(
                     f"directive {chain[-2].directive_id} does not narrow its recorded parent "
                     f"{current}"
@@ -228,14 +345,18 @@ def resolve_directive_authority(
             effective &= set(capabilities)
         current = link.parent_directive_id
 
+    reason = f"resolved from {len(chain)} recorded directive(s)"
+    if len(supersession) > 1:
+        reason += f", after {len(supersession) - 1} recorded authority transition(s)"
     return DirectiveAuthorityStanding(
         directive_id=str(directive_id),
         source=GrantSource.RECORDED_DIRECTIVE.value,
         resolvable=True,
         effective_capabilities=tuple(sorted(effective or set())),
         grant_chain=tuple(chain),
-        basis_event_ids=tuple(link.event_id for link in chain),
-        reason=f"resolved from {len(chain)} recorded directive(s)",
+        basis_event_ids=tuple(link.event_id for link in chain) + supersession_basis,
+        reason=reason,
+        **superseded,
     )
 
 

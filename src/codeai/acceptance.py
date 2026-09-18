@@ -255,9 +255,12 @@ def _authority_reasons(decision, directive_id: str | None) -> list[str]:
         return []
     if directive_id is None:
         return ["acceptance_authority_unresolved:task_names_no_directive"]
+    # After a transition the directive in force is the successor, and naming it
+    # is what tells an operator where to look.
+    effective = decision.standing.effective_directive_id or directive_id
     if decision.status == AuthorizationStatus.DENIED:
-        return [f"acceptance_not_granted:{directive_id}"]
-    return [f"acceptance_authority_unresolved:{decision.status}:{directive_id}"]
+        return [f"acceptance_not_granted:{effective}"]
+    return [f"acceptance_authority_unresolved:{decision.status}:{effective}"]
 
 
 def _validate(runtime: Runtime, request: AcceptanceRequest) -> tuple[list[str], list[str]]:

@@ -78,7 +78,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
         ("K", "ENFORCED"),       # replay -> current authority
         ("L", "DERIVED"),        # durable state -> decision
         ("M", "ENFORCED"),       # check -> artifact identity  (gap 3, repaired by W1-R3)
-        ("N", "ABSENT"),         # human gate -> acceptance grant  (new, raised by W1-R2)
+        ("N", "ENFORCED"),       # human gate -> acceptance grant (raised by W1-R2, met by W1-E1)
     ],
 )
 def test_the_frozen_classification_of_each_joint(probes, probe_id, classification):
@@ -102,12 +102,18 @@ def test_gap_a_repaired_a_caller_can_no_longer_supply_acceptance_authority(probe
     assert probes["B"]["classification"] == "ENFORCED"
 
 
-def test_the_human_gate_now_names_a_grant_nobody_can_add(probes):
-    """Raised by W1-R2, not repaired: recorded as a finding for the author."""
+def test_the_human_gate_opens_by_changing_authority_not_by_bypassing_it(probes):
+    """Raised by W1-R2 as ABSENT; met by W1-E1 (experiments/W1-E1-authority-transition.md)."""
     observed = " | ".join(probes["N"]["observed"])
     assert "scheduler: ASK_HUMAN" in observed
-    assert "a human answering that gate -> rejected: acceptance_not_granted" in observed
-    assert "the task ends at: ASK_HUMAN" in observed
+    # Bypassing is still refused...
+    assert "a human accepting without changing authority -> rejected" in observed
+    assert "the task waits at: ASK_HUMAN" in observed
+    # ...and the legal path is a durable change of authority, then the ordinary rule.
+    assert "after a recorded authority transition: accept granted = True" in observed
+    assert "the same acceptance, under the ordinary rule -> completed" in observed
+    assert "the task now ends at: STOP" in observed
+    assert probes["N"]["classification"] == "ENFORCED"
 
 
 def test_gap_b_repaired_a_governed_operation_must_match_its_decision(probes):
