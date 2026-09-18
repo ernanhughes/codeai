@@ -1,0 +1,32 @@
+{
+  "action_under_decision": {
+    "status": "succeeded",
+    "adapter_calls": 1
+  },
+  "action_request_fields": [
+    "action_id",
+    "actor_id",
+    "adapter",
+    "adapter_id",
+    "capability",
+    "directive_id",
+    "idempotency_key",
+    "instruction",
+    "payload",
+    "precondition_hash",
+    "recovery_version",
+    "requested_by",
+    "task_id"
+  ],
+  "decision_only_in_application_payload": true,
+  "action_after_basis_moved": {
+    "status": "succeeded",
+    "adapter_calls": 1
+  },
+  "governance_on_an_action_naming_a_decision": {
+    "status": "unknown_decision",
+    "reason": "decision dec-1 is not recorded"
+  },
+  "claim_movement_moves_the_freshness_digest": false,
+  "falsifier_survives": true
+}
