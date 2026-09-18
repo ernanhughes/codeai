@@ -48,11 +48,16 @@ independent, or that the environment was hermetic.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+import re
 from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from .adapters import CheckRequest, CheckResult, CheckVerdict, VerificationAdapter
+from .artifacts import ArtifactCorruptionError
 from .domain import ClaimStatus, EvidenceClass
 from .interpretation import now_utc
 from .ledger import Event
@@ -61,6 +66,9 @@ if TYPE_CHECKING:
     from .runtime import Runtime
 
 VERIFICATION_V1 = "verification-v1"
+
+ARTIFACT_PLACEHOLDER = "{artifact}"
+ARTIFACT_TARGET = re.compile(r"^artifact:sha256:([0-9a-f]{64})$")
 
 CHECK_REQUESTED = "check.requested"
 CHECK_COMPLETED = "check.completed"
@@ -97,6 +105,52 @@ class VerificationBinding:
         return {
             "requested_state_hash": self.requested_state_hash,
             "observed_state_hash": self.observed_state_hash,
+            "status": str(self.status),
+            "reason": self.reason,
+            "version": self.version,
+        }
+
+
+class ArtifactBindingStatus(StrEnum):
+    """What the runtime could establish about the bytes the check was given."""
+
+    BOUND = "bound"            # resolved from the store, digest verified, supplied
+    UNBOUND = "unbound"        # the check names no artifact
+    MISSING = "missing"        # named, and not retrievable
+    MISMATCH = "mismatch"      # the stored bytes do not hash to the named digest
+    UNCONSUMED = "unconsumed"  # a command check that was never given the artifact
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactBinding:
+    """The bytes a check was given, as the runtime resolved them.
+
+    Acceptance used to compare the check request target string with the artifact
+    it was accepting: a label the caller wrote, checked against another label.
+    This resolves the artifact from the store, verifies its digest and hands the
+    bytes to the check, so the identity is a reading rather than an assertion
+    (composition audit gap 3).
+
+    The honest limit, and it is the same shape as the state binding: the runtime
+    establishes what the check was *given*, never what it read.
+    """
+
+    requested_artifact_sha256: str | None
+    resolved_artifact_sha256: str | None
+    materialized_path: str | None
+    status: str
+    reason: str | None = None
+    version: str = VERIFICATION_V1
+
+    @property
+    def permits_verification(self) -> bool:
+        return self.status in (ArtifactBindingStatus.BOUND, ArtifactBindingStatus.UNBOUND)
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "requested_artifact_sha256": self.requested_artifact_sha256,
+            "resolved_artifact_sha256": self.resolved_artifact_sha256,
+            "materialized": self.materialized_path is not None,
             "status": str(self.status),
             "reason": self.reason,
             "version": self.version,
@@ -214,11 +268,104 @@ def bind_check_target(runtime: Runtime, request: CheckRequest) -> VerificationBi
     )
 
 
+def bind_check_artifact(
+    runtime: Runtime, request: CheckRequest, workdir: str | None
+) -> tuple[ArtifactBinding, CheckRequest]:
+    """Resolve the named artifact, verify it, and give it to the check.
+
+    Returns the binding and the request the verifier should actually receive:
+    ARTIFACT_PLACEHOLDER in the command is substituted with the path the runtime
+    wrote, and ``materialized_artifact_path`` is set from the runtime, never from
+    the caller.
+    """
+    prepared = replace(request, materialized_artifact_path=None)
+    target = request.target or ""
+    match = ARTIFACT_TARGET.match(target)
+    if match is None:
+        reason = (
+            "the check names no artifact"
+            if not target
+            else f"target {target!r} does not name an artifact"
+        )
+        return (
+            ArtifactBinding(None, None, None, ArtifactBindingStatus.UNBOUND.value, reason),
+            prepared,
+        )
+
+    requested = match.group(1)
+    store = getattr(runtime, "artifact_store", None)
+    if store is None or workdir is None:
+        return (
+            ArtifactBinding(
+                requested, None, None, ArtifactBindingStatus.MISSING.value,
+                "no artifact store is configured, so the bytes cannot be established",
+            ),
+            prepared,
+        )
+
+    try:
+        content = store.read_bytes(requested)
+    except ArtifactCorruptionError as exc:
+        return (
+            ArtifactBinding(requested, None, None, ArtifactBindingStatus.MISMATCH.value, str(exc)),
+            prepared,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unretrievable artifact is not a verdict
+        return (
+            ArtifactBinding(
+                requested, None, None, ArtifactBindingStatus.MISSING.value,
+                f"artifact {requested} could not be read: {type(exc).__name__}: {exc}",
+            ),
+            prepared,
+        )
+
+    observed = hashlib.sha256(content).hexdigest()
+    if observed != requested:
+        return (
+            ArtifactBinding(
+                requested, observed, None, ArtifactBindingStatus.MISMATCH.value,
+                f"artifact digest mismatch: expected {requested}, observed {observed}",
+            ),
+            prepared,
+        )
+
+    path = Path(workdir) / f"artifact-{requested[:16]}"
+    path.write_bytes(content)
+    materialized = str(path)
+
+    if request.command:
+        if not any(ARTIFACT_PLACEHOLDER in part for part in request.command):
+            # A command check that never receives the artifact cannot have
+            # examined it. That is a broken measurement, not a verdict.
+            return (
+                ArtifactBinding(
+                    requested, observed, None, ArtifactBindingStatus.UNCONSUMED.value,
+                    f"the command never references {ARTIFACT_PLACEHOLDER}, so the artifact it "
+                    f"claims to check was never given to it",
+                ),
+                prepared,
+            )
+        prepared = replace(
+            prepared,
+            command=tuple(part.replace(ARTIFACT_PLACEHOLDER, materialized)
+                          for part in request.command),
+            materialized_artifact_path=materialized,
+        )
+    else:
+        prepared = replace(prepared, materialized_artifact_path=materialized)
+
+    return (
+        ArtifactBinding(requested, observed, materialized, ArtifactBindingStatus.BOUND.value, None),
+        prepared,
+    )
+
+
 def execute_verification(
     runtime: Runtime,
     request: CheckRequest,
     binding: VerificationBinding,
     verifier: VerificationAdapter,
+    artifact_binding: ArtifactBinding | None = None,
 ) -> CheckResult:
     """Run the verifier if the binding permits it, and vet what comes back.
 
@@ -231,6 +378,9 @@ def execute_verification(
         # Infrastructure uncertainty is never epistemic uncertainty.
         return _error(request, binding.reason or "target binding failed", started_at=now,
                       completed_at=now_utc())
+    if artifact_binding is not None and not artifact_binding.permits_verification:
+        return _error(request, artifact_binding.reason or "artifact binding failed",
+                      started_at=now, completed_at=now_utc())
 
     started_at = now
     try:
@@ -270,7 +420,10 @@ def _unusable(request: CheckRequest, result: object) -> str | None:
 
 
 def finalize_verification(
-    runtime: Runtime, result: CheckResult, binding: VerificationBinding
+    runtime: Runtime,
+    result: CheckResult,
+    binding: VerificationBinding,
+    artifact_binding: ArtifactBinding | None = None,
 ) -> CheckResult:
     """Attach artifacts, then overwrite the verifier's account of its subject.
 
@@ -283,6 +436,9 @@ def finalize_verification(
         stored,
         observed_target_state_hash=binding.observed_state_hash,
         binding_status=str(binding.status),
+        artifact_binding_status=(
+            str(artifact_binding.status) if artifact_binding is not None else None
+        ),
     )
 
 
@@ -293,6 +449,7 @@ def record_verification(
     result: CheckResult,
     request_event: Event,
     verifier: VerificationAdapter,
+    artifact_binding: ArtifactBinding | None = None,
 ) -> Event:
     """Append what was verified, against what, by whom, under which policy."""
     event = Event.create(
@@ -302,6 +459,9 @@ def record_verification(
         payload={
             **asdict(result),
             "binding": binding.as_payload(),
+            "artifact_binding": (
+                artifact_binding.as_payload() if artifact_binding is not None else None
+            ),
             "declared_verdict_policy": dict(request.verdict_policy)
             if request.verdict_policy
             else None,
@@ -416,8 +576,12 @@ def run_check(
     runtime.ledger.append(request_event)
 
     binding = bind_check_target(runtime, request)
-    result = execute_verification(runtime, request, binding, verifier)
-    result = finalize_verification(runtime, result, binding)
-    record_verification(runtime, request, binding, result, request_event, verifier)
+    with TemporaryDirectory(prefix="codeai-check-") as workdir:
+        artifact_binding, prepared = bind_check_artifact(runtime, request, workdir)
+        result = execute_verification(runtime, prepared, binding, verifier, artifact_binding)
+        result = finalize_verification(runtime, result, binding, artifact_binding)
+    record_verification(
+        runtime, request, binding, result, request_event, verifier, artifact_binding
+    )
     apply_verification_to_claims(runtime, request, result)
     return result

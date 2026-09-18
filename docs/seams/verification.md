@@ -71,6 +71,31 @@ status, and ERROR records nothing against the claim at all. The deliberate evide
 (`record_claim_evidence`) now separates `check_errored` from `check_inconclusive`, which were one
 reason code before.
 
+## Repair W1-R3: the artifact a check examined is a reading too
+
+The composition audit (gap 3) found acceptance establishing *which bytes* a check examined by
+comparing the caller's `target` label with the artifact being accepted. The state binding was a
+runtime reading; the artifact binding was a string.
+
+`ArtifactBinding` is now runtime-owned and recorded beside the state binding:
+
+```text
+BOUND        resolved from the store, digest verified, written where the check can read it
+UNBOUND      the check names no artifact
+MISSING      named, and not retrievable                      -> ERROR, verifier never runs
+MISMATCH     the stored bytes do not hash to the named digest -> ERROR, verifier never runs
+UNCONSUMED   a command check that never references {artifact} -> ERROR, verifier never runs
+```
+
+`{artifact}` in a command is substituted with the path the runtime wrote after verifying the digest,
+and `materialized_artifact_path` is set from the runtime — a caller who sets it is overwritten, just
+as a verifier who reports its own observed state hash is. Acceptance compares the runtime's reading
+rather than the label, and refuses a pre-repair record as `check_artifact_unestablished` rather than
+reading it as if it could establish anything.
+
+The limit is the same shape as the state binding's: **this establishes what the check was given,
+never what it read.** Details: `experiments/W1-R3-artifact-binding.md`.
+
 ## Recording shape
 
 The event flow is unchanged — `check.requested` → binding → verifier → `check.completed` — and

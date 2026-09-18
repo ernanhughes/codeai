@@ -167,12 +167,18 @@ class Bench:
         )
 
     def check(self, check_id, *, script=MARKER_SCRIPT, claims=(), target_hash=None, target=None,
-              task_id="t1"):
+              task_id="t1", artifact_arg=False):
+        """A check over the world file, or -- with artifact_arg -- over the bytes.
+
+        ``{artifact}`` is the placeholder the runtime substitutes with the path
+        it materialized after verifying the digest.
+        """
+        subject = "{artifact}" if artifact_arg else str(self.target)
         return CheckRequest(
             check_id=check_id,
             task_id=task_id,
             claim_ids=claims,
-            command=(sys.executable, "-c", script, str(self.target)),
+            command=(sys.executable, "-c", script, subject),
             cwd=str(self.root),
             target=target,
             target_state_hash=target_hash,
@@ -315,10 +321,12 @@ def happy_path(stack) -> dict[str, object]:
          next_operation=str(state.next_operation), adapter_calls=worker.calls)
 
     verification = b.runtime.run_check(
-        b.check("k1", target_hash=b.state_hash(), target=artifact_target(produced["artifact_sha256"])),
+        b.check("k1", target_hash=b.state_hash(), artifact_arg=True,
+                target=artifact_target(produced["artifact_sha256"])),
         verifier=LocalCommandVerifier(),
     )
     step("verification", verdict=str(verification.verdict), binding=verification.binding_status,
+         artifact_binding=verification.artifact_binding_status,
          observed=(verification.observed_target_state_hash or "")[:16])
 
     third = b.runtime.decide_next_for_task("t1")
@@ -397,7 +405,7 @@ def probe_b_acceptance_authority(stack) -> Probe:
     b.task("t1")
     produced = b.produce_candidate()
     b.runtime.run_check(
-        b.check("k1", target=artifact_target(produced["artifact_sha256"])),
+        b.check("k1", artifact_arg=True, target=artifact_target(produced["artifact_sha256"])),
         verifier=LocalCommandVerifier(),
     )
     standing = b.runtime.directive_authority("d-root")
@@ -693,16 +701,16 @@ def probe_i_verification_to_acceptance(stack) -> Probe:
         except AcceptanceRejected as exc:
             return f"rejected: {', '.join(exc.reasons)}"
 
-    b.runtime.run_check(b.check("k-other", script="import sys; sys.exit(0)",
+    b.runtime.run_check(b.check("k-other", script="import sys; sys.exit(0)", artifact_arg=True,
                                 target=artifact_target(other["artifact_sha256"])), verifier=verifier)
     p.see(f"PASS on a different artifact -> {accept(['k-other'])}")
 
-    b.runtime.run_check(b.check("k-maybe", script="import sys; sys.exit(2)",
+    b.runtime.run_check(b.check("k-maybe", script="import sys; sys.exit(2)", artifact_arg=True,
                                 target=artifact_target(produced["artifact_sha256"])),
                         verifier=verifier)
     p.see(f"INCONCLUSIVE on the right artifact -> {accept(['k-maybe'])}")
 
-    b.runtime.run_check(b.check("k-err", script="import sys; sys.exit(7)",
+    b.runtime.run_check(b.check("k-err", script="import sys; sys.exit(7)", artifact_arg=True,
                                 target=artifact_target(produced["artifact_sha256"])),
                         verifier=verifier)
     p.see(f"ERROR on the right artifact -> {accept(['k-err'])}")
@@ -711,20 +719,20 @@ def probe_i_verification_to_acceptance(stack) -> Probe:
                         verifier=verifier)
     p.see(f"PASS with no artifact label -> {accept(['k-unlabelled'])}")
 
-    b.runtime.run_check(b.check("k-good", script="import sys; sys.exit(0)",
+    b.runtime.run_check(b.check("k-good", script="import sys; sys.exit(0)", artifact_arg=True,
                                 target=artifact_target(produced["artifact_sha256"])),
                         verifier=verifier)
     p.see(f"PASS labelled with the accepted artifact -> {accept(['k-good'])}")
 
-    requested = {e.stream_id: e.payload for e in b.ledger.events_by_kind(("check.requested",))}
-    p.see(f"the artifact binding acceptance trusts is the request's 'target' string: "
-          f"{requested['k-good']['target'][:32]}...")
-    p.see(f"that check's state binding was: "
-          f"{requested['k-good']['target_state_hash']} (none requested)")
-    p.classification = "RECORDED"
-    p.note = ("Acceptance matches a caller-supplied label on the check request. Nothing establishes "
-              "that the verifier read those bytes: state binding is a runtime reading, artifact "
-              "binding is a string.")
+    completed = {e.stream_id: e.payload for e in b.ledger.events_by_kind(("check.completed",))}
+    artifact_binding = completed["k-good"].get("artifact_binding") or {}
+    p.see(f"the artifact identity acceptance rests on: status={artifact_binding.get('status')}, "
+          f"materialized={artifact_binding.get('materialized')}")
+    p.see(f"resolved digest: {str(artifact_binding.get('resolved_artifact_sha256'))[:16]}...")
+    p.classification = "RECORDED" if artifact_binding.get("status") != "bound" else "ENFORCED"
+    p.note = ("Baseline (f0c730b): acceptance matched a caller-written label against another label. "
+              "After W1-R3 the runtime resolves the artifact from the store, verifies its digest and "
+              "materializes it for the check, and acceptance compares that reading.")
     b.close()
     return p
 
@@ -858,11 +866,15 @@ def probe_m_artifact_label(stack) -> Probe:
     p.see(f"check request labelled target={artifact_target(produced['artifact_sha256'])[:28]}...")
     p.see(f"acceptance citing that check -> {outcome}")
     completed = {e.stream_id: e.payload for e in b.ledger.events_by_kind(("check.completed",))}
-    p.see(f"the completed check's own binding: {completed['k-blind']['binding']['status']}")
-    p.classification = "CONVENTIONAL"
-    p.note = ("The artifact a check examined is asserted by whoever built the CheckRequest. The "
-              "verification seam established the *state* binding from the runtime's own reading; "
-              "acceptance relies on a different and weaker binding for bytes.")
+    artifact_binding = completed["k-blind"].get("artifact_binding") or {}
+    p.see(f"the check's own verdict: {completed['k-blind']['verdict']}")
+    p.see(f"artifact binding: {artifact_binding.get('status')} -- "
+          f"{artifact_binding.get('reason')}")
+    p.classification = "CONVENTIONAL" if "completed" in outcome else "ENFORCED"
+    p.note = ("Baseline (f0c730b): a command that never opened the artifact carried its label, "
+              "passed, and completed an acceptance. After W1-R3 a command check that never "
+              "references the materialized artifact is UNCONSUMED, which is ERROR rather than a "
+              "verdict. What the command does with the bytes it is given remains its own business.")
     b.close()
     return p
 
@@ -876,7 +888,7 @@ def probe_n_human_gate_and_acceptance_grant(stack) -> Probe:
     b.task("t1")
     produced = b.produce_candidate()
     b.runtime.run_check(
-        b.check("k1", script="import sys; sys.exit(0)",
+        b.check("k1", script="import sys; sys.exit(0)", artifact_arg=True,
                 target=artifact_target(produced["artifact_sha256"])),
         verifier=LocalCommandVerifier(),
     )
@@ -897,11 +909,12 @@ def probe_n_human_gate_and_acceptance_grant(stack) -> Probe:
     p.see(f"the task ends at: {b.runtime.decide_next_for_task('t1').operation}")
     p.see("the gate can only be opened by recording a grant, which this task cannot acquire")
     p.classification = "ABSENT"
-    p.note = ("W1-R2 makes acceptance authority come from the record, which means ASK_HUMAN on a "
-              "chain without ACCEPT names a gate no API call can pass. Either the directive grants "
-              "ACCEPT up front, or the task cannot be accepted. There is no explicit, durably "
-              "attributed override path -- by design so far, and a decision the author should make "
-              "knowingly.")
+    p.note = ("Not a stuck scheduler: the durable process has reached a state from which completion "
+              "is unauthorized, which is the correct result. What is absent is a legal transition "
+              "out of it. Human intervention should change authority durably and then re-project, "
+              "never bypass it -- so the missing capability is authority transition (supersession), "
+              "not an acceptance override. Delegation may only narrow; altering authority is a "
+              "different operation. Queued as BOOK-CORE/authority-transition.")
     b.close()
     return p
 

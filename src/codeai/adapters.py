@@ -325,6 +325,10 @@ class CheckRequest:
     # How outcomes map to verdicts, declared before execution so the mapping is
     # recorded rather than inferred from what came back (see codeai.verification).
     verdict_policy: Mapping[str, object] | None = None
+    # Runtime-owned: where the runtime wrote the verified artifact bytes for this
+    # check. A caller setting it is overwritten; ARTIFACT_PLACEHOLDER in the
+    # command is substituted with this path.
+    materialized_artifact_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,6 +355,9 @@ class CheckResult:
     # Runtime-owned: what the runtime could establish about the checked subject.
     # A verifier cannot set this; codeai.verification overwrites it.
     binding_status: str | None = None
+    # Runtime-owned: what the runtime could establish about the bytes the check
+    # was given (see ArtifactBinding).
+    artifact_binding_status: str | None = None
 
 
 class VerificationAdapter(Protocol):

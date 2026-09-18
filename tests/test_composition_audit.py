@@ -73,11 +73,11 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
         ("F", "ENFORCED"),       # observed state -> binding
         ("G", "ENFORCED"),       # command -> verdict semantics
         ("H", "DERIVED"),        # verification -> claim evidence      (gap: claim-side trace)
-        ("I", "RECORDED"),       # verification -> acceptance
+        ("I", "ENFORCED"),       # verification -> acceptance  (gap 3, repaired by W1-R3)
         ("J", "ENFORCED"),       # acceptance -> completion
         ("K", "ENFORCED"),       # replay -> current authority
         ("L", "DERIVED"),        # durable state -> decision
-        ("M", "CONVENTIONAL"),   # check -> artifact identity          (gap)
+        ("M", "ENFORCED"),       # check -> artifact identity  (gap 3, repaired by W1-R3)
         ("N", "ABSENT"),         # human gate -> acceptance grant  (new, raised by W1-R2)
     ],
 )
@@ -131,11 +131,17 @@ def test_gap_c_repaired_a_worker_report_alone_no_longer_observes_the_effect(prob
     assert probes["D"]["classification"] == "DERIVED"
 
 
-def test_gap_d_acceptance_trusts_the_artifact_label_on_the_check(probes):
+def test_gap_d_repaired_a_labelled_check_no_longer_stands_in_for_the_bytes(probes):
+    """Audit gap 3, repaired by W1-R3 (experiments/W1-R3-artifact-binding.md).
+
+    Baseline at f0c730b: 'acceptance citing that check -> completed'.
+    """
     observed = " | ".join(probes["M"]["observed"])
     assert "it never opened the artifact" in observed
-    assert "acceptance citing that check -> completed" in observed
-    assert "the completed check's own binding: unbound" in observed
+    assert "acceptance citing that check -> rejected" in observed
+    assert "artifact binding: unconsumed" in observed
+    assert "the check's own verdict: ERROR" in observed
+    assert probes["M"]["classification"] == "ENFORCED"
 
 
 # ---------------- the properties that did survive composition ----------------
