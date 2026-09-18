@@ -263,6 +263,10 @@ class ActionRequest:
     # - adapter/adapter_id: transport that performed it (e.g. "opencode")
     requested_by: str | None = None
     adapter_id: str | None = None
+    # Optional: the Chapter 18 decision this operation claims as its
+    # justification. Citing one invites the runtime to check that the claims it
+    # rested on still stand; citing none claims no evidentiary basis at all.
+    decision_id: str | None = None
 
     def effective_requester(self) -> str:
         return self.requested_by or self.actor_id

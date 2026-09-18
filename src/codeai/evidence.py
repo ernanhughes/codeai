@@ -473,6 +473,178 @@ def project_decision_standing(runtime: Runtime, decision_id: str) -> DecisionSta
     )
 
 
+DECISION_EVIDENCE_V1 = "decision-evidence-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class BasisClaimStanding:
+    """One claim a decision relied on, and whether it still bears the weight."""
+
+    claim_id: str
+    verdict: str          # intact | defeated | unknown
+    reason: str
+    recorded_status: str | None = None
+    current_status: str | None = None
+    recorded_evidence_class: str | None = None
+    current_evidence_class: str | None = None
+    new_refuting_evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionEvidenceStanding:
+    """Whether a decision's recorded evidentiary basis is still admissible.
+
+    Deliberately narrower than ``project_decision_standing``, which reports any
+    difference from the recorded snapshot. A decision that has *gained*
+    supporting evidence has changed and has not been defeated, and gating on
+    change rather than defeat would revoke decisions for becoming better founded.
+    """
+
+    decision_id: str
+    admissible: bool
+    found: bool
+    claims: tuple[BasisClaimStanding, ...] = ()
+    decision_event_id: str | None = None
+    version: str = DECISION_EVIDENCE_V1
+
+    @property
+    def defeated(self) -> tuple[BasisClaimStanding, ...]:
+        return tuple(c for c in self.claims if c.verdict == "defeated")
+
+    @property
+    def unknown(self) -> tuple[BasisClaimStanding, ...]:
+        return tuple(c for c in self.claims if c.verdict == "unknown")
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "admissible": self.admissible,
+            "found": self.found,
+            "decision_event_id": self.decision_event_id,
+            "claims": [
+                {
+                    "claim_id": c.claim_id,
+                    "verdict": c.verdict,
+                    "reason": c.reason,
+                    "recorded_status": c.recorded_status,
+                    "current_status": c.current_status,
+                    "recorded_evidence_class": c.recorded_evidence_class,
+                    "current_evidence_class": c.current_evidence_class,
+                    "new_refuting_evidence_ids": list(c.new_refuting_evidence_ids),
+                }
+                for c in self.claims
+            ],
+            "version": DECISION_EVIDENCE_V1,
+        }
+
+
+DEFEATING_STATUSES = frozenset({ClaimStatus.REFUTED.value, ClaimStatus.CONTESTED.value})
+
+
+def _basis_claim_standing(runtime: Runtime, snapshot: dict[str, Any]) -> BasisClaimStanding:
+    """Judge one recorded basis claim against its standing now.
+
+    The rules are frozen in experiments/W2-3-prereg.md. Attempts are not
+    standing: an INCONCLUSIVE or ERROR verification moved no claim, so it cannot
+    defeat a decision that relied on one.
+    """
+    claim_id = str(snapshot.get("claim_id"))
+    standing = project_claim_standing(runtime, claim_id)
+    recorded_status = snapshot.get("status")
+    recorded_class = snapshot.get("evidence_class")
+    if standing is None:
+        return BasisClaimStanding(
+            claim_id=claim_id, verdict="unknown",
+            reason="the claim can no longer be projected, so its support cannot be established",
+            recorded_status=recorded_status, recorded_evidence_class=recorded_class,
+        )
+
+    current = _snapshot(standing)
+    recorded_refuting = tuple(str(i) for i in (snapshot.get("refuting_evidence_ids") or ()))
+    current_refuting = tuple(str(i) for i in (current.get("refuting_evidence_ids") or ()))
+    new_refuting = tuple(i for i in current_refuting if i not in set(recorded_refuting))
+    common = {
+        "claim_id": claim_id,
+        "recorded_status": recorded_status,
+        "current_status": current.get("status"),
+        "recorded_evidence_class": recorded_class,
+        "current_evidence_class": current.get("evidence_class"),
+        "new_refuting_evidence_ids": new_refuting,
+    }
+
+    if new_refuting:
+        # Refutation arrived after the decision. Later re-support does not
+        # resurrect it: the judgment was made against a state that has since
+        # been overturned, and the honest repair is a new decision.
+        return BasisClaimStanding(
+            verdict="defeated",
+            reason=f"refuting evidence was recorded after the decision: {', '.join(new_refuting)}",
+            **common,
+        )
+    if str(current.get("status")) in DEFEATING_STATUSES:
+        return BasisClaimStanding(
+            verdict="defeated",
+            reason=f"the claim now stands as {current.get('status')}",
+            **common,
+        )
+    current_class = current.get("evidence_class")
+    if current_class is not None:
+        rank = _RANK[EvidenceClass(str(current_class))]
+        if rank < _RANK[MINIMUM_DECISION_EVIDENCE]:
+            return BasisClaimStanding(
+                verdict="defeated",
+                reason=f"evidence fell to {current_class}, below the decision minimum",
+                **common,
+            )
+        if recorded_class is not None and rank < _RANK[EvidenceClass(str(recorded_class))]:
+            return BasisClaimStanding(
+                verdict="defeated",
+                reason=f"evidence fell from {recorded_class} to {current_class}",
+                **common,
+            )
+    if (
+        snapshot.get("source_call_status") == "succeeded"
+        and current.get("source_call_status") != "succeeded"
+    ):
+        return BasisClaimStanding(
+            verdict="defeated",
+            reason=(
+                f"the source call's adopted status is now "
+                f"{current.get('source_call_status')}, not succeeded"
+            ),
+            **common,
+        )
+    return BasisClaimStanding(
+        verdict="intact",
+        reason="the claim still bears the weight the decision put on it",
+        **common,
+    )
+
+
+def project_decision_evidence(runtime: Runtime, decision_id: str) -> DecisionEvidenceStanding:
+    """Is this decision's recorded evidentiary basis still admissible? Appends nothing."""
+    recorded = [
+        event for event in runtime.ledger.events_by_kind((DECISION_RECORDED,))
+        if event.stream_id == str(decision_id)
+    ]
+    if len(recorded) != 1:
+        return DecisionEvidenceStanding(
+            decision_id=str(decision_id), admissible=False, found=False
+        )
+    event = recorded[0]
+    claims = tuple(
+        _basis_claim_standing(runtime, dict(snapshot))
+        for snapshot in (event.payload.get("basis") or ())
+    )
+    return DecisionEvidenceStanding(
+        decision_id=str(decision_id),
+        admissible=all(c.verdict == "intact" for c in claims),
+        found=True,
+        claims=claims,
+        decision_event_id=event.event_id,
+    )
+
+
 def decisions_resting_on(runtime: Runtime, claim_id: str) -> tuple[DecisionStanding, ...]:
     """Every recorded decision that relied on the claim, with its standing now."""
     return tuple(

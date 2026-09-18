@@ -72,6 +72,7 @@ from .domain import (
 )
 from .evidence import (
     ClaimExtraction,
+    project_decision_evidence,
     ClaimStanding,
     DecisionRequest,
     DecisionStanding,
@@ -446,6 +447,46 @@ class Runtime:
             )
         )
 
+        # Does the justification this operation cites still stand? Authority has
+        # already answered whether the effect may happen; this asks whether the
+        # reason for it survived. Both can refuse, for different reasons, and an
+        # operation citing no decision is asked neither question.
+        if request.decision_id:
+            evidence = project_decision_evidence(self, str(request.decision_id))
+            if not evidence.admissible:
+                if not evidence.found:
+                    reason = f"decision_unknown:{request.decision_id}"
+                elif evidence.defeated:
+                    first = evidence.defeated[0]
+                    reason = f"decision_basis_defeated:{first.claim_id}: {first.reason}"
+                else:
+                    first = evidence.unknown[0]
+                    reason = f"decision_basis_unknown:{first.claim_id}: {first.reason}"
+                self.ledger.append(
+                    Event.create(
+                        stream_id=request.action_id,
+                        kind="action.decision_basis_refused",
+                        actor_id=request.effective_requester(),
+                        payload={
+                            "action_id": request.action_id,
+                            "task_id": request.task_id,
+                            "reason": reason,
+                            **evidence.as_payload(),
+                        },
+                        causation_id=request_event.event_id,
+                        correlation_id=request.task_id,
+                    )
+                )
+                refused = ActionResult(
+                    action_id=request.action_id,
+                    status=ActionStatus.FAILED,
+                    started_at=now_utc(),
+                    completed_at=now_utc(),
+                    error=f"decision basis refused: {reason}",
+                )
+                self._append_action_result_event(refused, actor_id=request.actor_id)
+                return refused
+
         existing = self._find_action_result(request.idempotency_key)
         if existing is not None:
             # The replay is disclosed under its own authorization basis, which
@@ -737,6 +778,10 @@ class Runtime:
     def decision_standing(self, decision_id: str) -> DecisionStanding:
         """Compare a decision's recorded basis with the claims' standing now; appends nothing."""
         return project_decision_standing(self, decision_id)
+
+    def decision_evidence(self, decision_id: str):
+        """Is this decision's recorded evidentiary basis still admissible? Appends nothing."""
+        return project_decision_evidence(self, decision_id)
 
     def decisions_resting_on(self, claim_id: str) -> tuple[DecisionStanding, ...]:
         """Every recorded decision that relied on a claim, with its standing now."""
