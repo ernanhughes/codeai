@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from codeai.router_contract import ORACLE_VERSION, digest, validate_corpus  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-CORPUS = HERE / "router_cases_v1.DRAFT.json"
+CORPUS = HERE / "router_cases_v1.CANDIDATE.json"   # reviewed at Checkpoint A
 
 PRECEDENCE = """Canonical precedence (Ch28 design section 1b), which every reason must cite:
 
