@@ -213,3 +213,15 @@ Sealed fan-out (wave 2) is unaffected by all five and can proceed in parallel if
   time.
 - This document is not edited when a later seam repairs a finding. A repair writes a new entry that
   cites the gap number here.
+
+---
+
+## Erratum (appended, not rewritten)
+
+The summary line above reads "Four of them are not gated by it." The matrix in §1 is authoritative and
+shows **five** joints that were RECORDED or CONVENTIONAL rather than ENFORCED — B, C, D, I, M — plus
+two classified DERIVED (H, L), of which H carried gap 5. Baseline totals from
+`W1-composition-results.json`: 6 ENFORCED, 3 RECORDED, 2 CONVENTIONAL, 2 DERIVED, 13 probes.
+
+The sentence is left as written because this document is frozen evidence. The correction is recorded
+here and the checkable counts are the ones later work cites.
