@@ -1,0 +1,55 @@
+{
+  "verdict": "SYNTHETIC_INSTRUMENT_TEST_ONLY",
+  "components_exercised": [
+    "C",
+    "R1",
+    "R2"
+  ],
+  "decisions_recorded": 25,
+  "decisions_with_usage": 0,
+  "deterministic_arms_cost_zero": true,
+  "model_arms_priced": true,
+  "distractor_pairs_scored": [
+    "D+D/baseline",
+    "D/baseline",
+    "M+D/baseline",
+    "M+D/model",
+    "M-direct/baseline",
+    "M-direct/model",
+    "M-direct/prompt"
+  ],
+  "independent_verifier_ran": true,
+  "raw_output_preserved_per_decision": true,
+  "arm_cost_table": {
+    "C": {
+      "D+D/baseline": 0.0,
+      "D/baseline": 0.0,
+      "M+D/baseline": 0.00036,
+      "M+D/model": 0.00036,
+      "M-direct/baseline": 0.00036,
+      "M-direct/model": 0.00036,
+      "M-direct/prompt": 0.00036
+    },
+    "R1": {
+      "D/baseline": 0.0,
+      "M-direct/baseline": 0.00018,
+      "M-direct/field_order": 0.00018,
+      "M-direct/model": 0.00018,
+      "M-direct/prompt": 0.00018
+    },
+    "R2": {
+      "D+D/baseline": 0.0,
+      "M+D/baseline": 0.00018,
+      "M+D/model": 0.00018,
+      "M-direct/baseline": 0.00018,
+      "M-direct/model": 0.00018,
+      "M-direct/prompt": 0.00018
+    }
+  },
+  "distinct_prompts_per_case": {
+    "test-base": 3,
+    "test-r1": 3,
+    "test-r2": 3,
+    "test-variant": 3
+  }
+}
