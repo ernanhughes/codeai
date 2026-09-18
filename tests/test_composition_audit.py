@@ -48,7 +48,9 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
     operations = [
         step["operation"] for step in lifecycle["trace"] if step["step"].startswith("decision")
     ]
-    assert operations == ["CALL", "CHECK", "ASK_HUMAN", "STOP"]
+    # Post-W1-R2 the lifecycle chain grants ACCEPT, so nothing is owed at step 3.
+    # The ASK_HUMAN branch is probe N, where the chain grants none.
+    assert operations == ["CALL", "CHECK", "STOP", "STOP"]
     assert lifecycle["reopen_identical"] is True
     assert lifecycle["reprojected_status"] == "completed"
     assert lifecycle["reprojected_decision"] == "STOP"
@@ -64,7 +66,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
     ("probe_id", "classification"),
     [
         ("A", "ENFORCED"),       # directive -> action authority
-        ("B", "RECORDED"),       # directive -> acceptance authority   (gap)
+        ("B", "ENFORCED"),       # directive -> acceptance authority (gap 2, repaired by W1-R2)
         ("C", "CONVENTIONAL"),   # decision -> execution               (gap)
         ("D", "DERIVED"),        # report -> effect state   (gap 1, repaired by W1-R1)
         ("E", "ENFORCED"),       # effect -> reconciliation
@@ -76,6 +78,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
         ("K", "ENFORCED"),       # replay -> current authority
         ("L", "DERIVED"),        # durable state -> decision
         ("M", "CONVENTIONAL"),   # check -> artifact identity          (gap)
+        ("N", "ABSENT"),         # human gate -> acceptance grant  (new, raised by W1-R2)
     ],
 )
 def test_the_frozen_classification_of_each_joint(probes, probe_id, classification):
@@ -85,12 +88,26 @@ def test_the_frozen_classification_of_each_joint(probes, probe_id, classificatio
 # ---------------- the four gaps, as reproducers ----------------
 
 
-def test_gap_a_caller_supplied_acceptance_authority_completes_the_task(probes):
-    """A record that grants no ACCEPT does not stop an acceptance that claims it."""
+def test_gap_a_repaired_a_caller_can_no_longer_supply_acceptance_authority(probes):
+    """Audit gap 2, repaired by W1-R2 (experiments/W1-R2-authority-symmetry.md).
+
+    Baseline at f0c730b: the same caller claim completed the task.
+    """
     observed = " | ".join(probes["B"]["observed"])
     assert "allows accept: False" in observed
-    assert "-> completed" in observed
-    assert "task.accepted payload names a directive: False" in observed
+    assert "rejected: acceptance_not_granted:d-root" in observed
+    assert "task.accepted events: 0; durable refusals: 1" in observed
+    assert "refusal names the directive it resolved: d-root" in observed
+    assert "what the caller claimed, recorded as a claim: ['accept']" in observed
+    assert probes["B"]["classification"] == "ENFORCED"
+
+
+def test_the_human_gate_now_names_a_grant_nobody_can_add(probes):
+    """Raised by W1-R2, not repaired: recorded as a finding for the author."""
+    observed = " | ".join(probes["N"]["observed"])
+    assert "scheduler: ASK_HUMAN" in observed
+    assert "a human answering that gate -> rejected: acceptance_not_granted" in observed
+    assert "the task ends at: ASK_HUMAN" in observed
 
 
 def test_gap_b_the_recorded_decision_does_not_gate_the_effect(probes):

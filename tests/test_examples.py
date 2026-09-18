@@ -74,12 +74,14 @@ def test_ch28_scheduler_example(capsys):
     summary = load("ch28_scheduler.py").main()
     capsys.readouterr()
 
-    # Each decision came from facts the ledger established, in this order.
-    assert summary["decisions"] == ["CALL", "CHECK", "ASK_HUMAN", "STOP"]
-    # The task stopped because an acceptance completed it, not because a caller
-    # said so: the directive never granted ACCEPT.
+    # Two tasks, identical but for one recorded capability, diverge at step 3.
+    assert summary["gated"] == ["CALL", "CHECK", "ASK_HUMAN", "ASK_HUMAN"]
+    assert summary["granted"] == ["CALL", "CHECK", "STOP", "STOP"]
+    # And the acceptance is decided the same way the scheduler read it.
+    assert summary["acceptance"]["t-gated"].startswith("refused (acceptance_not_granted")
+    assert summary["acceptance"]["t-full"] == "completed"
     assert summary["final_state"]["process_complete"] is True
-    assert summary["final_state"]["acceptance_authority_available"] is False
+    assert summary["final_state"]["acceptance_authority_available"] is True
     # Decision 2 is history. The world moved on; the record did not.
     assert summary["recorded_second"] == "CHECK"
     assert summary["reprojected_now"] == "STOP"

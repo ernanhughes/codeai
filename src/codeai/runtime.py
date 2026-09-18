@@ -15,6 +15,7 @@ from .acceptance import (
     AcceptanceRequest,
     TaskCompletion,
     project_task_completion,
+    resolve_acceptance_authority,
 )
 from .acceptance import (
     accept_task as _accept_task,
@@ -508,13 +509,24 @@ class Runtime:
     # Task acceptance: the only path to task.completed
     # ------------------------------------------------------------------
 
-    def accept_task(self, request: AcceptanceRequest, *, authority: Authority) -> TaskCompletion:
+    def accept_task(
+        self, request: AcceptanceRequest, *, authority: Authority | None = None
+    ) -> TaskCompletion:
         """Accept an exact artifact for a task; see codeai.acceptance.
 
+        Authority to accept is resolved from the task own recorded directive
+        chain. ``authority`` is accepted for compatibility, recorded as a claim,
+        and never consulted: a caller cannot widen what the record grants.
+
         Raises AcceptanceRejected (after recording task.acceptance_rejected)
-        when any reference fails validation.
+        when authority cannot be established or any reference fails validation.
         """
         return _accept_task(self, request, authority=authority)
+
+    def acceptance_authority(self, task_id: str):
+        """Whether the record grants ACCEPT for this task, and on what basis."""
+        decision, _ = resolve_acceptance_authority(self, task_id)
+        return decision
 
     def task_completion(self, task_id: str) -> TaskCompletion:
         """Project task completion from the ledger without appending."""

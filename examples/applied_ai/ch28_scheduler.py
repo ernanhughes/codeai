@@ -4,17 +4,22 @@ Run it:
 
     python examples/applied_ai/ch28_scheduler.py
 
-One task, four decisions, each taken from facts projected out of the record:
+Two tasks, identical in every way except one recorded fact: whether their
+directive grants ACCEPT. The scheduler reads that fact rather than being told
+it, and the two tasks diverge at the same point in their lives.
 
-    1  nothing proposed yet                          -> CALL
-    2  a candidate exists, a declared check is owed   -> CHECK
-    3  the check passed, no recorded accept grant     -> ASK_HUMAN
-    4  a human with that authority accepted           -> STOP
+    gated task    CALL -> CHECK -> ASK_HUMAN   the record authorizes no acceptance
+    granted task  CALL -> CHECK -> STOP        nothing is owed; acceptance may proceed
+
+Then the acceptance itself, decided the same way:
+
+    gated task    refused: acceptance_not_granted -- and a person cannot widen it
+    granted task  completed, on the grant the record establishes
 
 Then the point of recording a decision at all: decision 2 was CHECK. The world
-moved on, and reprojecting the task now yields STOP. Decision 2 still says
-CHECK, because that is what was decided, on facts that were true then -- and
-replaying its recorded state through today's policy still yields CHECK.
+moved on, and reprojecting now yields STOP. Decision 2 still says CHECK, because
+that is what was decided, on facts that were true then -- and replaying its
+recorded state through today's policy still yields CHECK.
 
 The reduction a chapter can print:
 
@@ -22,8 +27,8 @@ The reduction a chapter can print:
     decision = decide_next_step(state.to_scheduler_input())   # what to do
     record(decision, state)                                   # what was decided, and why
 
-The scheduler never reads the ledger and never appends to it. It cannot invent
-a fact, because it is handed nothing but facts the projection derived.
+The scheduler never reads the ledger and never appends to it. It cannot invent a
+fact, because it is handed nothing but facts the projection derived.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from codeai.acceptance import (
+    AcceptanceRejected,
     AcceptanceRequest,
     artifact_target,
     criteria_sha256,
@@ -57,7 +63,7 @@ class PassingVerifier:
     """A static verifier. The point here is the joint, not the checker."""
 
     def run(self, request: CheckRequest) -> CheckResult:
-        return CheckResult(check_id=request.check_id, verdict=CheckVerdict.PASS, exit_code=0)
+        return CheckResult(check_id=request.check_id, verdict=CheckVerdict.PASS)
 
 
 def synthetic_post(text: str):
@@ -76,9 +82,7 @@ def produce_candidate(runtime: Runtime, task_id: str):
     """One recorded call through the ordinary path. Returns the ids it produced."""
     actor = ActorRef("repairer", "model", provider="opencode", model="mimo-v2.5")
     context = ContextCompiler().compile(
-        task_id=task_id,
-        actor=actor,
-        prompt="Repair: pages load 73% faster [S1].",
+        task_id=task_id, actor=actor, prompt="Repair: pages load 73% faster [S1].",
         prompt_version="repair-v1",
     )
     spec = CallSpec(
@@ -103,7 +107,7 @@ def show(label: str, runtime: Runtime, task_id: str) -> str:
     decision = runtime.decide_next_for_task(task_id)
     print(
         f"{label}: {str(decision.operation):9} <- proposals={state.proposal_count} "
-        f"check_required={state.check_required} check_satisfied={state.check_satisfied} "
+        f"check_owed={state.check_required and not state.check_satisfied} "
         f"accept_grant={state.acceptance_authority_available} "
         f"complete={state.process_complete}"
     )
@@ -127,67 +131,75 @@ def replay(snapshot: dict) -> object:
     )
 
 
+def open_directive(runtime: Runtime, directive_id: str, capabilities) -> None:
+    runtime.open_directive(
+        Directive(
+            directive_id=directive_id, objective="repair the cache paragraph",
+            success_criteria=(), budget=Budget(max_tokens=100_000),
+            authority=Authority(frozenset(capabilities)),
+        )
+    )
+
+
 def main() -> dict[str, object]:
     with TemporaryDirectory() as directory:
         root = Path(directory)
         ledger = SQLiteLedger(root / "ledger.sqlite")
         runtime = Runtime(ledger, artifact_store=FileArtifactStore(root / "artifacts", ledger))
 
-        # The directive grants WRITE. It never grants ACCEPT, so acceptance is a
-        # question this process is not authorized to answer for itself.
-        runtime.open_directive(
-            Directive(
-                directive_id="run-repair",
-                objective="repair the cache paragraph",
-                success_criteria=(),
-                budget=Budget(max_tokens=100_000),
-                authority=Authority(frozenset({Capability.WRITE})),
+        # The only difference between these two directives is one capability.
+        open_directive(runtime, "review-gated", {Capability.WRITE})
+        open_directive(runtime, "review-full", {Capability.WRITE, Capability.ACCEPT})
+        produced = {}
+        for task_id, directive_id in (("t-gated", "review-gated"), ("t-full", "review-full")):
+            runtime.create_task(
+                Task(task_id, directive_id, "Repair the paragraph", CRITERIA, Budget(), Authority())
             )
-        )
-        runtime.create_task(
-            Task(
-                "task-repair", "run-repair", "Repair the paragraph", CRITERIA, Budget(), Authority()
+
+        decisions: dict[str, list[str]] = {"t-gated": [], "t-full": []}
+        for task_id in ("t-gated", "t-full"):
+            decisions[task_id].append(show(f"1 nothing proposed  [{task_id:8}]", runtime, task_id))
+
+        for task_id in ("t-gated", "t-full"):
+            produced[task_id] = produce_candidate(runtime, task_id)
+            decisions[task_id].append(show(f"2 candidate exists  [{task_id:8}]", runtime, task_id))
+        recorded_second = [
+            event.payload for event in ledger.events_by_kind(("scheduler.decision_recorded",))
+            if event.payload["task_id"] == "t-full"
+        ][-1]
+
+        for task_id in ("t-gated", "t-full"):
+            call_id, attempt_id, interpretation_id, artifact_sha = produced[task_id]
+            runtime.run_check(
+                CheckRequest(check_id=f"k-{task_id}", task_id=task_id,
+                             target=artifact_target(artifact_sha)),
+                verifier=PassingVerifier(),
             )
-        )
+            decisions[task_id].append(show(f"3 check passed      [{task_id:8}]", runtime, task_id))
 
-        first = show("1 nothing proposed  ", runtime, "task-repair")
+        print()
+        outcomes = {}
+        for task_id in ("t-gated", "t-full"):
+            call_id, attempt_id, interpretation_id, artifact_sha = produced[task_id]
+            request = AcceptanceRequest(
+                acceptance_id=str(uuid.uuid4()), task_id=task_id, actor_id="reviewer",
+                criteria_sha256=criteria_sha256(CRITERIA), artifact_sha256=artifact_sha,
+                source_call_id=call_id, source_attempt_id=attempt_id,
+                source_interpretation_id=interpretation_id, check_ids=(f"k-{task_id}",),
+            )
+            try:
+                # Nothing is passed in: the grant comes from the task's directive.
+                outcomes[task_id] = str(runtime.accept_task(request).status)
+            except AcceptanceRejected as exc:
+                outcomes[task_id] = f"refused ({', '.join(exc.reasons)})"
+            print(f"acceptance [{task_id:8}]: {outcomes[task_id]}")
 
-        call_id, attempt_id, interpretation_id, artifact_sha = produce_candidate(
-            runtime, "task-repair"
-        )
-        second = show("2 candidate exists  ", runtime, "task-repair")
-        recorded_second = ledger.events_by_kind(("scheduler.decision_recorded",))[-1].payload
-
-        check_id = f"check-{uuid.uuid4()}"
-        runtime.run_check(
-            CheckRequest(
-                check_id=check_id, task_id="task-repair", target=artifact_target(artifact_sha)
-            ),
-            verifier=PassingVerifier(),
-        )
-        third = show("3 check passed      ", runtime, "task-repair")
-
-        # The human the scheduler asked for answers: an acceptor whose authority
-        # grants ACCEPT accepts these exact bytes against these exact criteria.
-        runtime.accept_task(
-            AcceptanceRequest(
-                acceptance_id=str(uuid.uuid4()),
-                task_id="task-repair",
-                actor_id="reviewer",
-                criteria_sha256=criteria_sha256(CRITERIA),
-                artifact_sha256=artifact_sha,
-                source_call_id=call_id,
-                source_attempt_id=attempt_id,
-                source_interpretation_id=interpretation_id,
-                check_ids=(check_id,),
-            ),
-            authority=Authority(frozenset({Capability.ACCEPT})),
-        )
-        fourth = show("4 accepted          ", runtime, "task-repair")
+        for task_id in ("t-gated", "t-full"):
+            decisions[task_id].append(show(f"4 after acceptance  [{task_id:8}]", runtime, task_id))
 
         # History, not a live recomputation. Decision 2 said CHECK on facts that
         # have since changed. It still says CHECK, and still replays to CHECK.
-        now = str(decide_next_step(runtime.process_state("task-repair").to_scheduler_input()).operation)
+        now = str(decide_next_step(runtime.process_state("t-full").to_scheduler_input()).operation)
         snapshot = recorded_second["state"]
         replayed = replay(snapshot)
 
@@ -201,12 +213,14 @@ def main() -> dict[str, object]:
         )
 
         summary = {
-            "decisions": [first, second, third, fourth],
+            "gated": decisions["t-gated"],
+            "granted": decisions["t-full"],
+            "acceptance": outcomes,
             "recorded_second": recorded_second["operation"],
             "reprojected_now": now,
             "replayed_second": str(replayed.operation),
             "second_state_check_satisfied": snapshot["check_satisfied"],
-            "final_state": state_snapshot(runtime.process_state("task-repair")),
+            "final_state": state_snapshot(runtime.process_state("t-full")),
             "basis_events": len(recorded_second["basis_event_ids"]),
         }
         ledger.close()

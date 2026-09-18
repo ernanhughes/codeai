@@ -28,7 +28,7 @@ from codeai.acceptance import (
 from codeai.adapters import CallSpec, CheckRequest, CheckResult, CheckVerdict
 from codeai.artifacts import FileArtifactStore
 from codeai.context import ContextCompiler
-from codeai.domain import ActorRef, Authority, Budget, Capability, Task
+from codeai.domain import ActorRef, Authority, Budget, Capability, Directive, Task
 from codeai.ledger import Event, SQLiteLedger
 from codeai.providers import HttpResponse, OpenCodeCognitionAdapter
 from codeai.runtime import Runtime
@@ -67,6 +67,26 @@ class StaticVerifier:
         )
 
 
+def ensure_directive(runtime, directive_id="run-repair", capabilities=(Capability.ACCEPT,)):
+    """Acceptance authority now comes from the task directive, so record one.
+
+    Idempotent: a second registration of the same id would make the chain
+    ambiguous, which is itself a refusal.
+    """
+    recorded = runtime.ledger.events_by_kind(("directive.opened",))
+    if any(event.stream_id == directive_id for event in recorded):
+        return
+    runtime.open_directive(
+        Directive(
+            directive_id=directive_id,
+            objective="fixture directive",
+            success_criteria=(),
+            budget=Budget(),
+            authority=Authority(frozenset(capabilities)),
+        )
+    )
+
+
 def make_runtime(path: Path) -> Runtime:
     ledger = SQLiteLedger(path / "ledger.sqlite")
     return Runtime(ledger, artifact_store=FileArtifactStore(path / "artifacts", ledger))
@@ -91,6 +111,7 @@ def produce(
     finish_reason: str = "stop",
     store: bool = True,
 ) -> Produced:
+    ensure_directive(runtime)
     runtime.create_task(
         Task(task_id, "run-repair", "Repair the paragraph", CRITERIA, Budget(), Authority())
     )
@@ -187,7 +208,13 @@ def test_valid_acceptance_completes_once_and_is_causally_linked(tmp_path):
     [accepted] = p.runtime.ledger.events_by_kind((TASK_ACCEPTED,))
     [completed] = p.runtime.ledger.events_by_kind((TASK_COMPLETED,))
     assert completed.causation_id == accepted.event_id
-    assert accepted.payload["authority_basis"] == ["accept"]
+    # The basis is now the resolved grant, not a list of what the caller passed.
+    basis = accepted.payload["authority_basis"]
+    assert accepted.payload["directive_id"] == "run-repair"
+    assert (basis["status"], basis["capability"]) == ("granted", "accept")
+    assert basis["grant_source"] == "recorded_directive"
+    assert [link["directive_id"] for link in basis["grant_chain"]] == ["run-repair"]
+    assert accepted.payload["caller_claimed_capabilities"] == ["accept"]
     assert completion.acceptance_event_id == accepted.event_id
     assert completion.completion_event_id == completed.event_id
 
@@ -286,11 +313,21 @@ def test_call_from_another_task_cannot_complete(tmp_path):
     assert rejected_reasons(p, request) == ("source_call_wrong_task",)
 
 
-def test_unauthorized_acceptor_cannot_complete(tmp_path):
+def test_the_caller_argument_is_no_longer_an_authority_source(tmp_path):
+    """The record grants ACCEPT; what the caller passes does not enter into it.
+
+    The other direction -- a caller claiming ACCEPT against a record that grants
+    none -- is the hostile case in tests/test_acceptance_authority.py.
+    """
     p = produce(make_runtime(tmp_path))
     everything_but_accept = Authority(frozenset(set(Capability) - {Capability.ACCEPT}))
-    reasons = rejected_reasons(p, request_for(p, [run_check(p)]), authority=everything_but_accept)
-    assert reasons == ("unauthorized",)
+    completion = p.runtime.accept_task(
+        request_for(p, [run_check(p)]), authority=everything_but_accept
+    )
+    assert completion.status == "completed"
+    [accepted] = p.runtime.ledger.events_by_kind((TASK_ACCEPTED,))
+    assert accepted.payload["authority_basis"]["status"] == "granted"
+    assert "accept" not in accepted.payload["caller_claimed_capabilities"]
 
 
 def test_producer_cannot_accept_its_own_output(tmp_path):
