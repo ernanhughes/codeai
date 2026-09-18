@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>W2-4 Human Adjudication</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --ink:#14171c; --muted:#667085; --line:#d9dde5;
+    --accent:#2563eb; --accent2:#1d4ed8; --ok:#137333; --warn:#a15c00; --bad:#b42318;
+    --shadow:0 10px 28px rgba(16,24,40,.08); --radius:16px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:16px/1.48 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+  button,input,textarea,select{font:inherit}
+  .app{max-width:1180px;margin:0 auto;padding:20px}
+  .top{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:16px}
+  h1{font-size:24px;margin:0}
+  .sub{color:var(--muted);font-size:14px}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+  .btn{border:1px solid var(--line);background:#fff;color:var(--ink);padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:650}
+  .btn:hover{border-color:#aeb6c4}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:var(--accent2)}
+  .btn.danger{color:var(--bad)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .hidden{display:none!important}
+  .drop{border:2px dashed #b8c0cc;border-radius:var(--radius);padding:46px 24px;text-align:center;background:#fff;box-shadow:var(--shadow)}
+  .drop.drag{border-color:var(--accent);background:#eff6ff}
+  .drop h2{margin:0 0 8px;font-size:22px}
+  .drop p{margin:6px 0;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:16px}
+  @media(max-width:850px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid #e6e9ef;border-radius:var(--radius);box-shadow:var(--shadow)}
+  .pad{padding:20px}
+  .case-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:14px}
+  .case-id{font-size:13px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--accent)}
+  .case-title{font-size:25px;font-weight:800;margin-top:3px}
+  .counter{white-space:nowrap;color:var(--muted);font-weight:700}
+  .progress-wrap{margin:10px 0 18px}
+  .progress-line{height:10px;background:#eef0f4;border-radius:99px;overflow:hidden}
+  .progress-bar{height:100%;width:0;background:var(--accent);transition:width .2s}
+  .progress-text{display:flex;justify-content:space-between;color:var(--muted);font-size:13px;margin-top:5px}
+  .section{border-top:1px solid #eceef2;padding-top:16px;margin-top:16px}
+  .section:first-of-type{border-top:0;padding-top:0}
+  .label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:800;margin-bottom:5px}
+  .narrative{font-size:19px;white-space:pre-wrap}
+  pre.json{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;border:1px solid #e5e7eb;padding:12px;border-radius:10px;margin:6px 0 0;font-size:13px}
+  .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+  .kv .item{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:9px}
+  .kv .k{font-size:11px;text-transform:uppercase;color:var(--muted);font-weight:800}
+  .kv .v{font-weight:700;overflow-wrap:anywhere}
+  .decision-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+  @media(max-width:700px){.decision-grid{grid-template-columns:1fr 1fr}.decision-grid button:last-child{grid-column:1/-1}}
+  .decision{padding:13px 8px;border-radius:11px;border:2px solid #d7dce5;background:#fff;cursor:pointer;font-weight:800}
+  .decision:hover{border-color:#93a4bd}
+  .decision.selected{border-color:var(--accent);background:#eff6ff;color:#174ea6}
+  .shortcut{font-size:11px;color:var(--muted);display:block;font-weight:500}
+  textarea,input[type=text]{width:100%;border:1px solid #cfd5df;border-radius:10px;padding:11px;background:#fff;color:var(--ink)}
+  textarea:focus,input:focus{outline:3px solid rgba(37,99,235,.12);border-color:var(--accent)}
+  textarea{min-height:112px;resize:vertical}
+  .facts{min-height:126px}
+  .fields{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .nav{display:flex;gap:8px;margin-top:18px;justify-content:space-between}
+  .nav .right{display:flex;gap:8px}
+  .status{border-radius:10px;padding:10px 12px;font-size:14px}
+  .status.ok{background:#edf7ee;color:var(--ok)}
+  .status.warn{background:#fff6e6;color:var(--warn)}
+  .status.bad{background:#fff0ee;color:var(--bad)}
+  details{border:1px solid #e3e7ee;border-radius:12px;background:#fff;margin-bottom:10px}
+  summary{cursor:pointer;font-weight:800;padding:12px 14px}
+  details .inside{padding:0 14px 14px;color:#374151}
+  .mini{font-size:13px;color:var(--muted)}
+  .summary-list{display:grid;gap:6px;max-height:310px;overflow:auto}
+  .row{display:flex;justify-content:space-between;gap:12px;padding:7px 9px;border-radius:8px;cursor:pointer}
+  .row:hover{background:#f5f7fa}
+  .row.current{background:#eef4ff}
+  .row .done{color:var(--ok);font-weight:800}
+  .row .todo{color:var(--muted)}
+  .badge{display:inline-block;border:1px solid #d4dae4;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700;margin-right:4px;background:#fff}
+  .warnbox{padding:11px 13px;border:1px solid #f1c48d;background:#fff8ed;color:#7a4300;border-radius:10px;margin-bottom:12px}
+  .saved{font-size:12px;color:var(--muted)}
+  .footer-note{font-size:12px;color:var(--muted);text-align:center;margin:18px 0}
+  .complete-overlay{padding:28px;text-align:center}
+  .complete-overlay h2{margin-top:0}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div>
+      <h1>W2-4 Human Adjudication</h1>
+      <div class="sub">One case at a time · independent human oracle worksheet · no model/router outputs</div>
+    </div>
+    <div class="toolbar">
+      <button id="openBtn" class="btn">Open worksheet JSON</button>
+      <button id="exportBtn" class="btn primary" disabled>Export updated JSON</button>
+      <button id="clearDraftBtn" class="btn danger" disabled>Clear local draft</button>
+      <input id="fileInput" type="file" accept=".json,application/json" class="hidden" />
+    </div>
+  </div>
+
+  <div id="dropZone" class="drop">
+    <h2>Open your adjudicator worksheet</h2>
+    <p>Choose <code>W2-4-oracle-worksheet-adjudicator-a.json</code> or <code>...-b.json</code>.</p>
+    <p>Drag the file here, or click <b>Open worksheet JSON</b>.</p>
+    <p class="mini">Your answers stay in this browser until you export them. This page makes no network calls.</p>
+  </div>
+
+  <div id="workspace" class="hidden">
+    <div class="progress-wrap">
+      <div class="progress-line"><div id="progressBar" class="progress-bar"></div></div>
+      <div class="progress-text"><span id="progressText">0 / 0 complete</span><span id="savedText" class="saved"></span></div>
+    </div>
+
+    <div class="grid">
+      <main class="card pad">
+        <div class="case-head">
+          <div>
+            <div id="caseId" class="case-id">CASE</div>
+            <div id="caseTitle" class="case-title">Case</div>
+          </div>
+          <div id="counter" class="counter">1 / 68</div>
+        </div>
+
+        <div id="caseContent"></div>
+
+        <div class="section">
+          <div class="label">Your decision</div>
+          <div class="decision-grid" id="decisionGrid">
+            <button class="decision" data-value="CALL">CALL<span class="shortcut">1</span></button>
+            <button class="decision" data-value="CHECK">CHECK<span class="shortcut">2</span></button>
+            <button class="decision" data-value="ASK_HUMAN">ASK HUMAN<span class="shortcut">3</span></button>
+            <button class="decision" data-value="STOP">STOP<span class="shortcut">4</span></button>
+            <button class="decision" data-value="AMBIGUOUS">AMBIGUOUS<span class="shortcut">5</span></button>
+          </div>
+          <div class="mini" style="margin-top:7px">Use <b>AMBIGUOUS</b> only when the supplied facts genuinely do not determine a unique decision under the frozen rules—not merely because the case is difficult.</div>
+        </div>
+
+        <div class="section">
+          <label class="label" for="reason">Reason</label>
+          <textarea id="reason" placeholder="Briefly explain why this decision follows from the supplied facts and precedence rules."></textarea>
+        </div>
+
+        <div class="section">
+          <label class="label" for="facts">Facts relied on</label>
+          <textarea id="facts" class="facts" placeholder="List the supplied facts you relied on. One per line works well."></textarea>
+        </div>
+
+        <div class="section">
+          <div class="fields">
+            <div>
+              <label class="label" for="version">Adjudication version</label>
+              <input id="version" type="text" value="1" />
+            </div>
+            <div>
+              <label class="label" for="timestamp">Timestamp</label>
+              <input id="timestamp" type="text" readonly />
+            </div>
+          </div>
+        </div>
+
+        <div id="caseStatus" class="status warn" style="margin-top:16px">Incomplete</div>
+
+        <div class="nav">
+          <button id="prevBtn" class="btn">← Previous</button>
+          <div class="right">
+            <button id="nextIncompleteBtn" class="btn">Next incomplete</button>
+            <button id="nextBtn" class="btn primary">Save & next →</button>
+          </div>
+        </div>
+      </main>
+
+      <aside>
+        <details open>
+          <summary>Adjudication instructions</summary>
+          <div class="inside">
+            <p>Judge each case only from the supplied facts and the frozen precedence rules.</p>
+            <p><b>Do not</b> consult model/router output, deterministic-arm output, the other adjudicator's worksheet, or an answer key.</p>
+            <p>Choose exactly one of <b>CALL, CHECK, ASK_HUMAN, STOP, AMBIGUOUS</b>.</p>
+            <p><b>AMBIGUOUS</b> is for genuine indeterminacy under the supplied facts and rules.</p>
+          </div>
+        </details>
+
+        <details id="rulesDetails">
+          <summary>Worksheet rules / precedence</summary>
+          <div class="inside" id="rulesContent">Load a worksheet to show any embedded instructions or precedence information.</div>
+        </details>
+
+        <details open>
+          <summary>Worksheet identity</summary>
+          <div class="inside">
+            <div id="worksheetMeta" class="mini"></div>
+            <div style="margin-top:10px">
+              <label class="label" for="adjudicatorId">Adjudicator identifier</label>
+              <input id="adjudicatorId" type="text" placeholder="e.g. adjudicator-a-v1" />
+            </div>
+          </div>
+        </details>
+
+        <details open>
+          <summary>Case navigator</summary>
+          <div class="inside">
+            <div class="toolbar" style="margin-bottom:8px">
+              <button id="showAllBtn" class="btn">All</button>
+              <button id="showIncompleteBtn" class="btn">Incomplete</button>
+            </div>
+            <div id="caseList" class="summary-list"></div>
+          </div>
+        </details>
+
+        <div id="draftNotice" class="warnbox hidden"></div>
+      </aside>
+    </div>
+
+    <div id="completePanel" class="card complete-overlay hidden" style="margin-top:16px">
+      <h2>All cases are complete</h2>
+      <p>You can still review any case before exporting.</p>
+      <button id="completeExportBtn" class="btn primary">Export completed worksheet JSON</button>
+    </div>
+  </div>
+
+  <div class="footer-note">
+    Local-only tool. Autosave uses browser localStorage; export writes a new JSON file. It does not send data anywhere.
+  </div>
+</div>
+
+<script>
+(() => {
+  const DECISIONS = ["CALL","CHECK","ASK_HUMAN","STOP","AMBIGUOUS"];
+  const $ = id => document.getElementById(id);
+  let doc = null, rows = [], rowPath = null, idx = 0, filename = "worksheet.json", draftKey = null;
+  let factsWasArray = false;
+  let filter = "all";
+
+  const els = {
+    drop:$("dropZone"), ws:$("workspace"), file:$("fileInput"), open:$("openBtn"), export:$("exportBtn"),
+    clear:$("clearDraftBtn"), progressBar:$("progressBar"), progressText:$("progressText"), saved:$("savedText"),
+    caseId:$("caseId"), caseTitle:$("caseTitle"), counter:$("counter"), content:$("caseContent"),
+    reason:$("reason"), facts:$("facts"), version:$("version"), timestamp:$("timestamp"),
+    status:$("caseStatus"), prev:$("prevBtn"), next:$("nextBtn"), nextIncomplete:$("nextIncompleteBtn"),
+    list:$("caseList"), meta:$("worksheetMeta"), adjudicatorId:$("adjudicatorId"), rules:$("rulesContent"),
+    complete:$("completePanel"), completeExport:$("completeExportBtn"), draftNotice:$("draftNotice"),
+    showAll:$("showAllBtn"), showIncomplete:$("showIncompleteBtn")
+  };
+
+  function esc(s){
+    return String(s ?? "").replace(/[&<>"']/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
+  }
+  function simpleHash(str){
+    let h=2166136261>>>0;
+    for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,16777619)}
+    return (h>>>0).toString(16).padStart(8,"0");
+  }
+  function isObj(v){return v && typeof v==="object" && !Array.isArray(v)}
+  function getCaseId(r,i){return r.case_id ?? r.caseId ?? r.id ?? r.key ?? `case-${i+1}`}
+  function getNested(r, keys){
+    for(const k of keys){
+      const parts=k.split(".");
+      let v=r, ok=true;
+      for(const p of parts){ if(v && Object.prototype.hasOwnProperty.call(v,p)) v=v[p]; else {ok=false;break;} }
+      if(ok && v!==undefined && v!==null && v!=="") return v;
+    }
+    return undefined;
+  }
+  function findRows(root){
+    const candidates=[];
+    function walk(v,path,depth){
+      if(depth>4) return;
+      if(Array.isArray(v) && v.length && v.every(x=>isObj(x))){
+        let score=0;
+        const sample=v.slice(0,Math.min(v.length,5));
+        for(const r of sample){
+          if("case_id" in r || "id" in r) score+=2;
+          if("decision" in r) score+=4;
+          if("reason" in r) score+=2;
+          if("facts" in r) score+=2;
+          if("narrative" in r || (r.case && r.case.narrative)) score+=2;
+        }
+        if(v.length>=10) score+=2;
+        candidates.push({arr:v,path,score});
+      }
+      if(isObj(v)) for(const [k,x] of Object.entries(v)) walk(x,path.concat(k),depth+1);
+    }
+    walk(root,[],0);
+    candidates.sort((a,b)=>b.score-a.score || b.arr.length-a.arr.length);
+    if(!candidates.length) throw new Error("Could not find the worksheet case array.");
+    return candidates[0];
+  }
+  function replaceAtPath(root,path,value){
+    if(!path.length) return value;
+    let cur=root;
+    for(let i=0;i<path.length-1;i++) cur=cur[path[i]];
+    cur[path[path.length-1]]=value;
+    return root;
+  }
+  function inferRules(root){
+    const keys=["precedence","precedence_table","rules","instructions","adjudication_instructions","section_1b","§1b"];
+    const found=[];
+    function walk(v,path,depth){
+      if(depth>3 || found.length>4) return;
+      if(isObj(v)){
+        for(const [k,x] of Object.entries(v)){
+          if(keys.some(q=>k.toLowerCase().includes(q.toLowerCase())) && (typeof x==="string" || isObj(x) || Array.isArray(x))){
+            found.push({path:path.concat(k).join("."),value:x});
+          }
+          walk(x,path.concat(k),depth+1);
+        }
+      }
+    }
+    walk(root,[],0);
+    if(!found.length) return `<p>No embedded precedence block was detected in this worksheet. Use the frozen §1b rules supplied with the experiment.</p>`;
+    return found.map(f=>`<div class="label">${esc(f.path)}</div><pre class="json">${esc(typeof f.value==="string"?f.value:JSON.stringify(f.value,null,2))}</pre>`).join("");
+  }
+  function caseFields(r){
+    const base = isObj(r.case) ? r.case : r;
+    const narrative = getNested(r,["narrative","case.narrative","text","case.text","prompt","case.prompt","question","case.question"]);
+    const state = getNested(r,["state","case.state","flags","case.flags"]);
+    const prior = getNested(r,["prior_history","case.prior_history","distractor","case.distractor","history","case.history"]);
+    const stratum = getNested(r,["stratum","case.stratum","group","case.group"]);
+    const pair = getNested(r,["pair_id","case.pair_id","pair","case.pair"]);
+    return {base,narrative,state,prior,stratum,pair};
+  }
+  function renderCaseContent(r){
+    const f=caseFields(r);
+    let out="";
+    if(f.stratum!==undefined || f.pair!==undefined){
+      out+=`<div class="section"><div>`;
+      if(f.stratum!==undefined) out+=`<span class="badge">Stratum ${esc(f.stratum)}</span>`;
+      if(f.pair!==undefined) out+=`<span class="badge">Pair ${esc(f.pair)}</span>`;
+      out+=`</div></div>`;
+    }
+    if(f.narrative!==undefined){
+      out+=`<div class="section"><div class="label">Narrative / case</div><div class="narrative">${esc(f.narrative)}</div></div>`;
+    }
+    if(f.state!==undefined){
+      if(isObj(f.state)){
+        out+=`<div class="section"><div class="label">State</div><div class="kv">`;
+        for(const [k,v] of Object.entries(f.state)){
+          out+=`<div class="item"><div class="k">${esc(k)}</div><div class="v">${esc(typeof v==="object"?JSON.stringify(v):v)}</div></div>`;
+        }
+        out+=`</div></div>`;
+      } else {
+        out+=`<div class="section"><div class="label">State</div><pre class="json">${esc(JSON.stringify(f.state,null,2))}</pre></div>`;
+      }
+    }
+    if(f.prior!==undefined){
+      out+=`<div class="section"><div class="label">Prior history / supplied additional material</div><pre class="json">${esc(typeof f.prior==="string"?f.prior:JSON.stringify(f.prior,null,2))}</pre></div>`;
+    }
+    if(!out){
+      const clone=JSON.parse(JSON.stringify(r));
+      for(const k of ["decision","reason","facts","version","timestamp","adjudicator_id","adjudicator"]) delete clone[k];
+      out=`<div class="section"><div class="label">Case data</div><pre class="json">${esc(JSON.stringify(clone,null,2))}</pre></div>`;
+    }
+    return out;
+  }
+  function decisionOf(r){return String(r.decision ?? "").trim().toUpperCase()}
+  function completeRow(r){
+    const d=decisionOf(r), reason=String(r.reason??"").trim(), version=String(r.version??"").trim(), ts=String(r.timestamp??"").trim();
+    let factsOk = Array.isArray(r.facts) ? r.facts.some(x=>String(x).trim()) : String(r.facts??"").trim().length>0;
+    return DECISIONS.includes(d) && !!reason && factsOk && !!version && !!ts;
+  }
+  function applyAdjudicatorId(){
+    const v=els.adjudicatorId.value.trim();
+    if(!v) return;
+    const topKeys=["adjudicator_id","adjudicator","adjudicator_identifier"];
+    let set=false;
+    for(const k of topKeys){
+      if(Object.prototype.hasOwnProperty.call(doc,k)){doc[k]=v;set=true}
+    }
+    if(!set){
+      // avoid inventing row-level fields; top-level metadata is safest fallback
+      doc.adjudicator_id=v;
+    }
+  }
+  function saveCurrent({touchTimestamp=true}={}){
+    if(!rows.length) return;
+    const r=rows[idx];
+    const selected=document.querySelector(".decision.selected");
+    r.decision=selected ? selected.dataset.value : "";
+    r.reason=els.reason.value;
+    if(factsWasArray){
+      r.facts=els.facts.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    }else{
+      r.facts=els.facts.value;
+    }
+    r.version=els.version.value || "1";
+    if(touchTimestamp && (r.decision || r.reason || (Array.isArray(r.facts)?r.facts.length:r.facts))){
+      if(!r.timestamp) r.timestamp=new Date().toISOString();
+    }
+    els.timestamp.value=r.timestamp ?? "";
+    applyAdjudicatorId();
+    localSave();
+    updateProgress();
+    renderList();
+    updateStatus();
+  }
+  function localSave(){
+    if(!draftKey || !doc) return;
+    try{
+      localStorage.setItem(draftKey,JSON.stringify({savedAt:new Date().toISOString(),filename,doc}));
+      els.saved.textContent="Autosaved " + new Date().toLocaleTimeString();
+    }catch(e){els.saved.textContent="Local autosave unavailable";}
+  }
+  function loadCase(i){
+    if(!rows.length) return;
+    saveCurrent({touchTimestamp:true});
+    idx=Math.max(0,Math.min(rows.length-1,i));
+    const r=rows[idx], id=getCaseId(r,idx);
+    els.caseId.textContent=id;
+    els.caseTitle.textContent=`Adjudicate ${id}`;
+    els.counter.textContent=`${idx+1} / ${rows.length}`;
+    els.content.innerHTML=renderCaseContent(r);
+    document.querySelectorAll(".decision").forEach(b=>b.classList.toggle("selected",b.dataset.value===decisionOf(r)));
+    els.reason.value=r.reason ?? "";
+    factsWasArray=Array.isArray(r.facts);
+    els.facts.value=factsWasArray ? r.facts.join("\n") : (r.facts ?? "");
+    els.version.value=r.version ?? "1";
+    els.timestamp.value=r.timestamp ?? "";
+    els.prev.disabled=idx===0;
+    els.next.textContent=idx===rows.length-1 ? "Save case" : "Save & next →";
+    updateStatus(); renderList();
+    window.scrollTo({top:0,behavior:"smooth"});
+  }
+  function updateStatus(){
+    const r=rows[idx];
+    if(completeRow(r)){
+      els.status.className="status ok"; els.status.textContent="Complete — this case has decision, reason, facts, version and timestamp.";
+    }else{
+      const missing=[];
+      if(!DECISIONS.includes(decisionOf(r))) missing.push("decision");
+      if(!String(r.reason??"").trim()) missing.push("reason");
+      const factsOk=Array.isArray(r.facts)?r.facts.some(x=>String(x).trim()):String(r.facts??"").trim();
+      if(!factsOk) missing.push("facts");
+      if(!String(r.version??"").trim()) missing.push("version");
+      if(!String(r.timestamp??"").trim()) missing.push("timestamp");
+      els.status.className="status warn"; els.status.textContent="Incomplete — missing: "+missing.join(", ");
+    }
+  }
+  function updateProgress(){
+    if(!rows.length) return;
+    const done=rows.filter(completeRow).length, pct=Math.round(done/rows.length*100);
+    els.progressBar.style.width=pct+"%";
+    els.progressText.textContent=`${done} / ${rows.length} complete (${pct}%)`;
+    els.complete.classList.toggle("hidden",done!==rows.length);
+  }
+  function renderList(){
+    const html=[];
+    rows.forEach((r,i)=>{
+      if(filter==="incomplete" && completeRow(r)) return;
+      const done=completeRow(r);
+      html.push(`<div class="row ${i===idx?"current":""}" data-i="${i}">
+        <span>${esc(getCaseId(r,i))}</span>
+        <span class="${done?"done":"todo"}">${done?"✓ "+esc(decisionOf(r)):"—"}</span>
+      </div>`);
+    });
+    els.list.innerHTML=html.join("") || `<div class="mini">No cases in this view.</div>`;
+    els.list.querySelectorAll(".row").forEach(x=>x.onclick=()=>loadCase(Number(x.dataset.i)));
+  }
+  function nextIncomplete(from=idx){
+    saveCurrent();
+    for(let step=1;step<=rows.length;step++){
+      const j=(from+step)%rows.length;
+      if(!completeRow(rows[j])){loadCase(j);return}
+    }
+    updateProgress();
+  }
+  function setDecision(v){
+    document.querySelectorAll(".decision").forEach(b=>b.classList.toggle("selected",b.dataset.value===v));
+    rows[idx].decision=v;
+    if(!rows[idx].timestamp) rows[idx].timestamp=new Date().toISOString();
+    els.timestamp.value=rows[idx].timestamp;
+    saveCurrent({touchTimestamp:false});
+  }
+  function exportJson(){
+    saveCurrent();
+    const out=JSON.stringify(doc,null,2)+"\n";
+    const blob=new Blob([out],{type:"application/json"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    const base=filename.replace(/\.json$/i,"");
+    a.download=base+"-completed.json";
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  }
+  async function loadFile(file){
+    const text=await file.text();
+    let parsed;
+    try{parsed=JSON.parse(text)}catch(e){alert("This is not valid JSON: "+e.message);return}
+    const found=findRows(parsed);
+    doc=parsed; rows=found.arr; rowPath=found.path; filename=file.name;
+    const corpusHash=getNested(parsed,["corpus_hash","corpus.sha256","metadata.corpus_hash","worksheet.corpus_hash"]) ?? "";
+    draftKey="w2-4-adjudication:"+filename+":"+String(corpusHash||simpleHash(text.slice(0,50000)));
+    const saved=localStorage.getItem(draftKey);
+    if(saved){
+      try{
+        const draft=JSON.parse(saved);
+        if(draft.doc && confirm(`A local draft for this worksheet was saved at ${new Date(draft.savedAt).toLocaleString()}.\n\nRestore that draft?`)){
+          doc=draft.doc;
+          const f2=findRows(doc); rows=f2.arr; rowPath=f2.path;
+          els.draftNotice.classList.remove("hidden");
+          els.draftNotice.textContent="Restored autosaved browser draft. Export JSON when finished.";
+        }
+      }catch(_){}
+    }
+    els.drop.classList.add("hidden");els.ws.classList.remove("hidden");
+    els.export.disabled=false;els.clear.disabled=false;
+    const adjudicator=getNested(doc,["adjudicator_id","adjudicator","adjudicator_identifier","metadata.adjudicator_id"]);
+    els.adjudicatorId.value=(adjudicator && !String(adjudicator).includes("REPLACE-WITH"))?String(adjudicator):"";
+    const metaBits=[
+      `File: ${filename}`,
+      `Rows detected: ${rows.length}`,
+      corpusHash?`Corpus: ${String(corpusHash).slice(0,16)}…`:"",
+      `Array path: ${rowPath.length?rowPath.join("."):"root"}`
+    ].filter(Boolean);
+    els.meta.innerHTML=metaBits.map(x=>`<div>${esc(x)}</div>`).join("");
+    els.rules.innerHTML=inferRules(doc);
+    idx=0; updateProgress(); renderList(); loadCase(0);
+  }
+
+  els.open.onclick=()=>els.file.click();
+  els.file.onchange=e=>{if(e.target.files[0]) loadFile(e.target.files[0])};
+  els.drop.onclick=()=>els.file.click();
+  ["dragenter","dragover"].forEach(ev=>els.drop.addEventListener(ev,e=>{e.preventDefault();els.drop.classList.add("drag")}));
+  ["dragleave","drop"].forEach(ev=>els.drop.addEventListener(ev,e=>{e.preventDefault();els.drop.classList.remove("drag")}));
+  els.drop.addEventListener("drop",e=>{const f=e.dataTransfer.files[0];if(f)loadFile(f)});
+  document.querySelectorAll(".decision").forEach(b=>b.onclick=()=>setDecision(b.dataset.value));
+  [els.reason,els.facts,els.version,els.adjudicatorId].forEach(x=>x.addEventListener("input",()=>saveCurrent({touchTimestamp:true})));
+  els.prev.onclick=()=>{saveCurrent();loadCase(idx-1)};
+  els.next.onclick=()=>{saveCurrent();if(idx<rows.length-1)loadCase(idx+1);else updateProgress()};
+  els.nextIncomplete.onclick=()=>nextIncomplete(idx);
+  els.export.onclick=exportJson; els.completeExport.onclick=exportJson;
+  els.showAll.onclick=()=>{filter="all";renderList()};
+  els.showIncomplete.onclick=()=>{filter="incomplete";renderList()};
+  els.clear.onclick=()=>{
+    if(draftKey && confirm("Delete the browser autosave for this worksheet? The loaded worksheet stays open.")){
+      localStorage.removeItem(draftKey); els.saved.textContent="Local draft cleared";
+      els.draftNotice.classList.add("hidden");
+    }
+  };
+  document.addEventListener("keydown",e=>{
+    if(!rows.length) return;
+    const tag=document.activeElement?.tagName;
+    const typing=tag==="TEXTAREA"||tag==="INPUT";
+    if(!typing && ["1","2","3","4","5"].includes(e.key)){setDecision(DECISIONS[Number(e.key)-1]);e.preventDefault()}
+    if(e.ctrlKey && e.key==="Enter"){saveCurrent();if(idx<rows.length-1)loadCase(idx+1);e.preventDefault()}
+    if(e.altKey && e.key==="ArrowRight"){saveCurrent();loadCase(Math.min(rows.length-1,idx+1));e.preventDefault()}
+    if(e.altKey && e.key==="ArrowLeft"){saveCurrent();loadCase(Math.max(0,idx-1));e.preventDefault()}
+  });
+  window.addEventListener("beforeunload",()=>{if(rows.length)saveCurrent({touchTimestamp:false})});
+})();
+</script>
+</body>
+</html>
