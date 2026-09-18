@@ -67,7 +67,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
     [
         ("A", "ENFORCED"),       # directive -> action authority
         ("B", "ENFORCED"),       # directive -> acceptance authority (gap 2, repaired by W1-R2)
-        ("C", "CONVENTIONAL"),   # decision -> execution               (gap)
+        ("C", "ENFORCED"),       # decision -> execution      (gap 4, repaired by W1-R4)
         ("D", "DERIVED"),        # report -> effect state   (gap 1, repaired by W1-R1)
         ("E", "ENFORCED"),       # effect -> reconciliation
         ("F", "ENFORCED"),       # observed state -> binding
@@ -110,12 +110,22 @@ def test_the_human_gate_now_names_a_grant_nobody_can_add(probes):
     assert "the task ends at: ASK_HUMAN" in observed
 
 
-def test_gap_b_the_recorded_decision_does_not_gate_the_effect(probes):
+def test_gap_b_repaired_a_governed_operation_must_match_its_decision(probes):
+    """Audit gap 4, repaired by W1-R4 (experiments/W1-R4-decision-execution-binding.md).
+
+    Baseline at f0c730b: 'caller executed an action anyway -> succeeded'.
+    """
     observed = " | ".join(probes["C"]["observed"])
     assert "recorded decision: CHECK" in observed
-    assert "caller executed an action anyway -> succeeded" in observed
-    assert "with no decision recorded at all -> succeeded" in observed
-    assert "references a decision: False" in observed
+    assert "action claiming that CHECK decision -> failed, adapter calls 0" in observed
+    assert "scheduler governance with no decision -> failed, adapter calls 0" in observed
+    # The external path stays open, and says what it is.
+    assert "action claiming nothing -> succeeded" in observed
+    assert "recorded as ungoverned/external_request" in observed
+    # Freshness: a decision the world has overtaken no longer permits anything.
+    assert "check under that fresh CHECK decision -> PASS" in observed
+    assert "the first decision, after the state moved -> ERROR" in observed
+    assert probes["C"]["classification"] == "ENFORCED"
 
 
 def test_gap_c_repaired_a_worker_report_alone_no_longer_observes_the_effect(probes):

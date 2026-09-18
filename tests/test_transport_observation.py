@@ -373,6 +373,7 @@ def test_event_order_success_error_noresponse(tmp_path):
         adapter=zen_adapter(TransportFailure("TimeoutError", "provider request failed: t/o")),
     )
     per_call = [
+        "operation.governance_recorded",
         "call.requested",
         "call.manifest",
         "attempt.started",
