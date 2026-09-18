@@ -19,6 +19,7 @@ from codeai.adapters import ActionRequest, ActionResult, ActionStatus
 from codeai.domain import Authority, Capability
 from codeai.ledger import Event, SQLiteLedger
 from codeai.runtime import Runtime
+from codeai.scheduler import Operation
 
 
 class CountingWriter:
@@ -386,3 +387,91 @@ def test_every_interruption_point_answers_safe_unsafe_or_unresolved(
     # No interruption point leaves the reader guessing.
     assert state.reason
     assert state.duplicate_effect_risk is (expected_effect == EffectState.UNKNOWN)
+
+
+# ---------------- REPORTED is not OBSERVED, downstream as well as in the enum ----------------
+
+
+def governed_runtime(tmp_path, *, resolver=None):
+    """A runtime with a directive and a task, so process-level effects are visible."""
+    from codeai.domain import Budget, Directive, Task
+
+    runtime = Runtime(SQLiteLedger(tmp_path / "ledger.sqlite"), state_resolver=resolver)
+    runtime.open_directive(
+        Directive(directive_id="d", objective="fixture", success_criteria=(),
+                  budget=Budget(), authority=Authority(frozenset({Capability.WRITE})))
+    )
+    runtime.create_task(Task("t", "d", "fixture", (), Budget(), Authority()))
+    return runtime
+
+
+def act(runtime, action_id, adapter):
+    return runtime.execute_action(
+        write_request(action_id, key=f"k-{action_id}", task_id="t", directive_id="d"),
+        adapter=adapter,
+    )
+
+
+@pytest.mark.parametrize(
+    "situation,effect,listed_as_open,escalates,reconcilable",
+    [
+        ("changed", EffectState.OBSERVED, False, False, False),
+        ("unchanged", EffectState.UNKNOWN, True, True, True),
+        ("unavailable", EffectState.REPORTED, False, False, False),
+    ],
+)
+def test_what_each_effect_state_does_downstream(
+    tmp_path, situation, effect, listed_as_open, escalates, reconcilable
+):
+    """The whole downstream surface of effect_state, in one table.
+
+    Only two consumers exist -- the open-effect list and reconciliation -- and
+    both ask for UNKNOWN exactly. Acceptance never consults an action at all.
+    A future helper that treats REPORTED as good enough breaks this row.
+    """
+    world = {"state": "before"}
+    if situation == "unavailable":
+        runtime = governed_runtime(tmp_path)
+        adapter = CountingWriter()
+    elif situation == "changed":
+        runtime = governed_runtime(tmp_path, resolver=lambda: world["state"])
+        adapter = WorldChangingWriter(world)
+    else:
+        runtime = governed_runtime(tmp_path, resolver=lambda: world["state"])
+        adapter = CountingWriter()
+
+    act(runtime, "a1", adapter)
+    state = runtime.action_state("a1")
+    assert state.effect_state == effect
+    assert state.result_status == "succeeded", "every situation reported the same thing"
+
+    assert (["a1"] if listed_as_open else []) == [
+        s.action_id for s in runtime.open_effects(task_id="t")
+    ]
+    assert runtime.process_state("t").unresolved_effects == (("a1",) if escalates else ())
+    assert (runtime.decide_next_for_task("t").operation == Operation.ASK_HUMAN) is escalates
+
+    if reconcilable:
+        runtime.reconcile_action("a1", verdict=ReconciliationVerdict.EFFECT_CONFIRMED,
+                                 actor_id="operator", evidence_refs=("file:target#seen",))
+    else:
+        with pytest.raises(ReconciliationRefused):
+            runtime.reconcile_action("a1", verdict=ReconciliationVerdict.EFFECT_CONFIRMED,
+                                     actor_id="operator")
+
+
+def test_a_reported_effect_completes_nothing(tmp_path):
+    """REPORTED must never stand in for an observed effect, or for acceptance."""
+    runtime = governed_runtime(tmp_path)  # no resolver: nothing can observe
+    act(runtime, "a1", CountingWriter())
+    assert runtime.action_state("a1").effect_state == EffectState.REPORTED
+
+    # It is not the same value as OBSERVED, and it satisfies nothing OBSERVED would.
+    assert EffectState.REPORTED != EffectState.OBSERVED
+    assert runtime.task_completion("t").status != "completed"
+    assert runtime.process_state("t").process_complete is False
+    # next=none means this layer has nothing further to infer, not that the
+    # intended operation is established: no verification, no acceptance, nothing.
+    assert runtime.action_state("a1").next_operation == ActionNextOperation.NONE
+    kinds = {event.kind for event in runtime.ledger.read_all()}
+    assert "check.completed" not in kinds and "task.accepted" not in kinds

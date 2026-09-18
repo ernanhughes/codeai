@@ -88,7 +88,9 @@ harness reproduces the baseline at `f0c730b` and this result after the repair.
    which is the only thing a record can do.
 2. **The two readings are not a transaction.** Anything else may move the scope between them, so
    CHANGED attributes the change to this action by proximity alone.
-3. **`REPORTED` is never promoted by later evidence** unless someone reconciles it deliberately.
+3. **`REPORTED` cannot be settled at all.** Reconciliation accepts only UNKNOWN, so later evidence
+   about a reported-but-unobserved effect has nowhere to go. Queued as a small follow-up rather than
+   widened here, because reconciliation's refusal rule is itself load-bearing.
 4. **Scope is still the resolver's** — one hash for everything it watches, nothing outside it.
 5. **An idle worker is not identified as dishonest.** UNCHANGED is a fact about the reading, not an
    accusation about the actor.

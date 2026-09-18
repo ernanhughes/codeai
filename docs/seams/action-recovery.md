@@ -124,5 +124,5 @@ and opposite verdicts.
 7. **Single writer.** Unchanged.
 8. **The two readings are not a transaction.** Anything else may have moved the scope between them,
    so CHANGED attributes the change to this action only by proximity.
-9. **`REPORTED` is not promoted by later evidence.** A deployment with no resolver stays at the
-   actor's word forever unless someone reconciles it deliberately.
+9. **`REPORTED` cannot be reconciled.** Reconciliation accepts only UNKNOWN, so a deployment with
+   no resolver stays at the actor's word with no way to record later evidence about it.
