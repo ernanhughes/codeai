@@ -14,6 +14,7 @@ bound target, produced this result.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -433,3 +434,185 @@ def test_a_check_establishes_the_result_not_the_adequacy_of_the_test(tmp_path):
     assert set(completed.payload["binding"]) == {
         "requested_state_hash", "observed_state_hash", "status", "reason", "version"
     }
+
+
+# ---------------- the artifact a check was given (W1-R3) ----------------
+
+
+def stored(runtime, text="the cache is intended to make page loads faster"):
+    return runtime.artifact_store.store_text(text, artifact_type="candidate_output")
+
+
+def artifact_check(check_id, ref, *, script=None, consumes=True):
+    """A check over stored bytes. ``consumes`` decides whether it is given them."""
+    from codeai.acceptance import artifact_target
+
+    command = ()
+    if script is not None:
+        subject = "{artifact}" if consumes else "/no/such/path"
+        command = (sys.executable, "-c", script, subject)
+    return CheckRequest(
+        check_id=check_id,
+        task_id="t1",
+        command=command,
+        cwd=".",
+        target=artifact_target(ref.sha256),
+        verdict_policy=EXIT_POLICY,
+    )
+
+
+READS_IT = (
+    "import sys, pathlib; "
+    "text = pathlib.Path(sys.argv[1]).read_text(); "
+    "sys.exit(0 if 'cache' in text else 1)"
+)
+
+
+def test_a_command_given_the_artifact_reads_the_bytes_the_runtime_verified(tmp_path):
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    result = runtime.run_check(
+        artifact_check("k", ref, script=READS_IT), verifier=declared_verifier()
+    )
+    assert result.verdict == CheckVerdict.PASS
+    assert result.artifact_binding_status == "bound"
+
+    completed = next(iter(runtime.ledger.events_by_kind(("check.completed",))))
+    binding = completed.payload["artifact_binding"]
+    assert binding["status"] == "bound"
+    assert binding["requested_artifact_sha256"] == ref.sha256
+    assert binding["resolved_artifact_sha256"] == ref.sha256
+    assert binding["materialized"] is True
+
+
+def test_a_command_that_never_references_the_artifact_is_an_error(tmp_path):
+    """Audit gap 3: a check that was never given the bytes cannot have read them."""
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    result = runtime.run_check(
+        artifact_check("k", ref, script="import sys; sys.exit(0)", consumes=False),
+        verifier=declared_verifier(),
+    )
+    assert result.verdict == CheckVerdict.ERROR
+    assert result.verdict != CheckVerdict.PASS
+    assert result.artifact_binding_status == "unconsumed"
+    assert "never given to it" in result.error
+
+
+def test_an_artifact_that_is_not_stored_is_an_error_not_a_verdict(tmp_path):
+    from codeai.acceptance import artifact_target, text_sha256
+
+    runtime = make_runtime(tmp_path)
+    result = runtime.run_check(
+        CheckRequest("k", "t1", target=artifact_target(text_sha256("never stored"))),
+        verifier=declared_verifier(),
+    )
+    assert result.verdict == CheckVerdict.ERROR
+    assert result.artifact_binding_status == "missing"
+
+
+def test_a_check_with_no_artifact_target_stays_unbound_and_runs(tmp_path):
+    runtime = make_runtime(tmp_path)
+    result = runtime.run_check(
+        CheckRequest("k", "t1", command=command("print('ok')"), cwd=".",
+                     target="file:some/path", verdict_policy=EXIT_POLICY),
+        verifier=declared_verifier(),
+    )
+    assert result.verdict == CheckVerdict.PASS
+    assert result.artifact_binding_status == "unbound"
+    completed = next(iter(runtime.ledger.events_by_kind(("check.completed",))))
+    assert "does not name an artifact" in completed.payload["artifact_binding"]["reason"]
+
+
+def test_a_verifier_without_a_command_is_still_handed_the_bytes(tmp_path):
+    """Static verifiers keep working, and the record says what they were given."""
+    seen = {}
+
+    class Static:
+        def run(self, request):
+            seen["path"] = request.materialized_artifact_path
+            seen["content"] = Path(request.materialized_artifact_path).read_text(encoding="utf-8")
+            return CheckResult(check_id=request.check_id, verdict=CheckVerdict.PASS)
+
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    result = runtime.run_check(artifact_check("k", ref), verifier=Static())
+    assert result.verdict == CheckVerdict.PASS
+    assert result.artifact_binding_status == "bound"
+    assert "cache" in seen["content"]
+
+
+def test_the_caller_cannot_set_the_materialized_path(tmp_path):
+    seen = {}
+
+    class Static:
+        def run(self, request):
+            # Read it here: the materialized copy is per-check and transient.
+            seen["path"] = request.materialized_artifact_path
+            seen["content"] = Path(seen["path"]).read_text(encoding="utf-8")
+            return CheckResult(check_id=request.check_id, verdict=CheckVerdict.PASS)
+
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    forged = replace(artifact_check("k", ref), materialized_artifact_path="/tmp/whatever-I-like")
+    runtime.run_check(forged, verifier=Static())
+    assert seen["path"] != "/tmp/whatever-I-like"
+    assert seen["content"].startswith("the cache")
+    # The copy does not outlive the check; the artifact itself lives in the store.
+    assert not Path(seen["path"]).exists()
+
+
+def test_corrupted_stored_bytes_are_a_mismatch_not_a_verdict(tmp_path):
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    # Overwrite the stored bytes behind the store's back.
+    path = runtime.artifact_store._path_for(ref.sha256)
+    path.write_text("something else entirely", encoding="utf-8")
+
+    result = runtime.run_check(
+        artifact_check("k", ref, script=READS_IT), verifier=declared_verifier()
+    )
+    assert result.verdict == CheckVerdict.ERROR
+    assert result.artifact_binding_status == "mismatch"
+    assert result.verdict != CheckVerdict.FAIL
+
+
+def test_the_two_bindings_are_independent(tmp_path):
+    """State binding and artifact binding answer different questions."""
+    runtime = make_runtime(tmp_path, state_resolver=lambda: "state-A")
+    ref = stored(runtime)
+    request = replace(artifact_check("k", ref, script=READS_IT), target_state_hash="state-A")
+    result = runtime.run_check(request, verifier=declared_verifier())
+    assert (result.binding_status, result.artifact_binding_status) == ("bound", "bound")
+
+    moved = replace(request, check_id="k2", target_state_hash="state-B")
+    second = runtime.run_check(moved, verifier=declared_verifier())
+    # The state moved; the artifact is still exactly what it was.
+    assert second.verdict == CheckVerdict.ERROR
+    assert (second.binding_status, second.artifact_binding_status) == ("mismatch", "bound")
+
+
+def test_artifact_binding_is_not_artifact_adequacy(tmp_path):
+    """BOUND says which bytes were supplied. It says nothing about the check.
+
+    Both of these are legitimately BOUND: one examines the artifact, the other
+    is handed it and ignores it. The runtime claims only the first thing.
+    """
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    meaningful = runtime.run_check(
+        artifact_check("k-real", ref, script=READS_IT), verifier=declared_verifier()
+    )
+    ignores_it = runtime.run_check(
+        artifact_check("k-lazy", ref, script="import sys; sys.exit(0)"),
+        verifier=declared_verifier(),
+    )
+    assert meaningful.artifact_binding_status == "bound"
+    assert ignores_it.artifact_binding_status == "bound"
+    assert (meaningful.verdict, ignores_it.verdict) == (CheckVerdict.PASS, CheckVerdict.PASS)
+    # The record establishes supply, not scrutiny. Whether the criterion was the
+    # right one, and whether the command applied it, is verification adequacy,
+    # which this seam deliberately does not address.
+    completed = {e.stream_id: e.payload for e in runtime.ledger.events_by_kind(("check.completed",))}
+    for check_id in ("k-real", "k-lazy"):
+        assert completed[check_id]["artifact_binding"]["materialized"] is True

@@ -391,7 +391,15 @@ def _validate_checks(
             reasons.append(f"check_unlinked:{check_id}")
         if str(req[0].payload.get("task_id")) != request.task_id:
             reasons.append(f"check_wrong_task:{check_id}")
-        if req[0].payload.get("target") != artifact_target(request.artifact_sha256):
+        binding = done[0].payload.get("artifact_binding")
+        if binding is None:
+            # A record written before artifact binding existed cannot establish
+            # which bytes the check examined, and is not read as if it could.
+            reasons.append(f"check_artifact_unestablished:{check_id}")
+        elif (
+            binding.get("status") != "bound"
+            or binding.get("resolved_artifact_sha256") != request.artifact_sha256
+        ):
             reasons.append(f"check_wrong_artifact:{check_id}")
         verdict = str(done[0].payload.get("verdict"))
         if verdict != passing:

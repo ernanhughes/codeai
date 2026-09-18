@@ -284,9 +284,12 @@ def test_check_recorded_for_another_task_cannot_complete(tmp_path):
 
 def test_check_of_different_bytes_cannot_complete(tmp_path):
     p = produce(make_runtime(tmp_path))
+    # Those bytes were never stored, so the check could not be given them: it
+    # errors, and it is also not a check of the artifact being accepted.
     check_id = run_check(p, sha=text_sha256("something else"))
     assert rejected_reasons(p, request_for(p, [check_id])) == (
         f"check_wrong_artifact:{check_id}",
+        f"check_not_passed:{check_id}:ERROR",
     )
 
 
@@ -351,8 +354,13 @@ def test_criteria_other_than_declared_cannot_complete(tmp_path):
 
 
 def test_unpreserved_artifact_cannot_complete(tmp_path):
+    # Nothing was preserved, so the check could not be given the bytes either:
+    # three independent reasons, none of them a verdict about the work.
     p = produce(make_runtime(tmp_path), store=False)
-    assert rejected_reasons(p, request_for(p, [run_check(p)])) == ("artifact_not_preserved",)
+    reasons = rejected_reasons(p, request_for(p, [run_check(p)]))
+    assert "artifact_not_preserved" in reasons
+    assert any(reason.startswith("check_wrong_artifact:") for reason in reasons)
+    assert any(reason.endswith(":ERROR") for reason in reasons)
 
 
 def test_completion_event_without_acceptance_projects_incomplete(tmp_path):
