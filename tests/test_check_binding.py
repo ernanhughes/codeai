@@ -45,8 +45,11 @@ def test_binding_records_one_reading_and_refuses_unestablished_state(tmp_path, m
     assert result.observed_target_state_hash == (actual if mode in {'match', 'mismatch'} else None)
     events = ledger.read_all()
     if mode != 'match':
+        # The fixture names a claim that was never recorded, so the attempt
+        # trace refuses the link rather than pointing at nothing.
         assert [e.kind for e in events] == [
-        'check.requested', 'operation.governance_recorded', 'check.completed']
+            'check.requested', 'operation.governance_recorded', 'check.completed',
+            'claim.verification_attempt_refused']
         assert result.error
     completed = next(iter(ledger.events_by_kind(('check.completed',))))
     assert completed.causation_id == events[0].event_id
@@ -100,7 +103,8 @@ def test_raising_verifier_becomes_durable_error_without_promotion(tmp_path):
     assert result.observed_target_state_hash == 'state-A'
     events = ledger.read_all()
     assert [e.kind for e in events] == [
-        'check.requested', 'operation.governance_recorded', 'check.completed']
+        'check.requested', 'operation.governance_recorded', 'check.completed',
+        'claim.verification_attempt_refused']
     completed = next(iter(ledger.events_by_kind(('check.completed',))))
     assert completed.causation_id == events[0].event_id
     assert completed.payload['verdict'] == 'ERROR'

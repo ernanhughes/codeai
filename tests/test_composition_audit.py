@@ -72,7 +72,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
         ("E", "ENFORCED"),       # effect -> reconciliation
         ("F", "ENFORCED"),       # observed state -> binding
         ("G", "ENFORCED"),       # command -> verdict semantics
-        ("H", "DERIVED"),        # verification -> claim evidence      (gap: claim-side trace)
+        ("H", "ENFORCED"),       # verification -> claim evidence (gap 5, repaired by W1-R5)
         ("I", "ENFORCED"),       # verification -> acceptance  (gap 3, repaired by W1-R3)
         ("J", "ENFORCED"),       # acceptance -> completion
         ("K", "ENFORCED"),       # replay -> current authority
@@ -189,11 +189,21 @@ def test_four_verdicts_survive_the_claim_and_acceptance_paths(probes):
     assert "check_wrong_artifact:k-other" in acceptance
 
 
-def test_an_errored_verification_leaves_no_trace_on_the_claim(probes):
-    """Registered in advance as a distinct property; confirmed as a gap."""
+def test_gap_e_repaired_an_errored_verification_is_discoverable_from_the_claim(probes):
+    """Audit gap 5, repaired by W1-R5 (experiments/W1-R5-claim-attempt-trace.md).
+
+    Baseline at f0c730b: the claim-side index was empty and the attempt could be
+    found only by scanning every check.requested for the claim id.
+    """
     observed = " | ".join(probes["H"]["observed"])
-    assert "'claim-scoped inconclusive index': 0" in observed
-    assert "by scanning check.requested for the claim id: ['k-error']" in observed
+    assert "attempts discoverable from the errored claim: [('k-error', 'ERROR', False)]" in observed
+    assert "'c-maybe': [('k-maybe', 'INCONCLUSIVE')]" in observed
+    # Visible as an attempt, and still moving nothing.
+    assert "'c-error': [False]" in observed and "'c-maybe': [False]" in observed
+    assert "'c-pass': [True]" in observed and "'c-fail': [True]" in observed
+    # A reference, not a second opinion.
+    assert "['check_completed_event_id', 'check_id', 'claim_id', 'version']" in observed
+    assert probes["H"]["classification"] == "ENFORCED"
 
 
 def test_replay_is_decided_against_the_record_as_it_stands(probes):

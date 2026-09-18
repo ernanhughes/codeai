@@ -616,3 +616,164 @@ def test_artifact_binding_is_not_artifact_adequacy(tmp_path):
     completed = {e.stream_id: e.payload for e in runtime.ledger.events_by_kind(("check.completed",))}
     for check_id in ("k-real", "k-lazy"):
         assert completed[check_id]["artifact_binding"]["materialized"] is True
+
+
+# ---------------- the attempt trace (W1-R5) ----------------
+
+# Two questions, deliberately answered by two projections:
+#
+#     visible from the claim?   every attempt, whatever came of it
+#     moves the claim?          PASS may support, FAIL may refute, nothing else
+
+
+def claimed(runtime, claim_id="c1"):
+    runtime.record_claim(
+        Claim(claim_id=claim_id, task_id="t1", statement="the marker is gone", source_call_id="m")
+    )
+    return claim_id
+
+
+@pytest.mark.parametrize(
+    "script,expected_verdict,moves_evidence",
+    [
+        ("import sys; sys.exit(0)", "PASS", True),
+        ("import sys; sys.exit(1)", "FAIL", True),
+        ("import sys; sys.exit(2)", "INCONCLUSIVE", False),
+        ("import sys; sys.exit(7)", "ERROR", False),
+    ],
+)
+def test_every_outcome_is_visible_from_the_claim(
+    tmp_path, script, expected_verdict, moves_evidence
+):
+    runtime = make_runtime(tmp_path)
+    claimed(runtime)
+    result = runtime.run_check(request("k1", script, claims=("c1",)), verifier=declared_verifier())
+    assert str(result.verdict) == expected_verdict
+
+    [attempt] = runtime.verification_attempts_for_claim("c1")
+    assert attempt.check_id == "k1"
+    assert attempt.verdict == expected_verdict
+    assert attempt.settled_the_claim is moves_evidence
+
+    claim = runtime.claims_for_task("t1")["c1"]
+    moved = (claim.status != ClaimStatus.ASSERTED) or (
+        claim.evidence_class != EvidenceClass.ASSERTED
+    )
+    assert moved is moves_evidence
+
+
+def test_an_attempt_the_verifier_never_ran_is_still_discoverable(tmp_path):
+    """The hostile case: binding fails, nothing runs, and the attempt survives."""
+    from codeai.acceptance import artifact_target, text_sha256
+
+    runtime = make_runtime(tmp_path)
+    claimed(runtime, "c-safe")
+    result = runtime.run_check(
+        CheckRequest("k-missing", "t1", claim_ids=("c-safe",),
+                     target=artifact_target(text_sha256("never stored"))),
+        verifier=ForgingVerifier(),
+    )
+    assert result.verdict == CheckVerdict.ERROR
+    assert result.artifact_binding_status == "missing"
+
+    [attempt] = runtime.verification_attempts_for_claim("c-safe")
+    assert (attempt.check_id, attempt.verdict) == ("k-missing", "ERROR")
+    assert attempt.artifact_binding_status == "missing"
+    assert attempt.settled_the_claim is False
+
+    # ...and the claim's evidence is exactly where it was.
+    assert runtime.claims_for_task("t1")["c-safe"].status == ClaimStatus.ASSERTED
+    kinds = [e.kind for e in runtime.ledger.read_all()]
+    assert "claim.status" not in kinds and "claim.evidence" not in kinds
+
+
+def test_the_trace_references_the_check_rather_than_copying_it(tmp_path):
+    runtime = make_runtime(tmp_path)
+    claimed(runtime)
+    runtime.run_check(
+        request("k1", "import sys; sys.exit(2)", claims=("c1",)), verifier=declared_verifier()
+    )
+    [event] = [
+        e for e in runtime.ledger.read_all() if e.kind == "claim.verification_attempted"
+    ]
+    # The claim side holds a relation and its provenance, and no verdict of its own.
+    assert set(event.payload) == {
+        "claim_id", "check_id", "check_completed_event_id", "version"
+    }
+    completed = next(iter(runtime.ledger.events_by_kind(("check.completed",))))
+    assert event.causation_id == completed.event_id
+    assert event.payload["check_completed_event_id"] == completed.event_id
+    # The verdict the trace reports comes from the check, every time it is read.
+    assert runtime.verification_attempts_for_claim("c1")[0].verdict == completed.payload["verdict"]
+
+
+def test_a_check_naming_no_claim_records_no_attempt(tmp_path):
+    runtime = make_runtime(tmp_path)
+    claimed(runtime)
+    runtime.run_check(request("k1", "import sys; sys.exit(0)"), verifier=declared_verifier())
+    assert runtime.verification_attempts_for_claim("c1") == ()
+    assert not [
+        e for e in runtime.ledger.read_all() if e.kind.startswith("claim.verification")
+    ]
+
+
+def test_an_unknown_claim_is_refused_rather_than_linked(tmp_path):
+    runtime = make_runtime(tmp_path)
+    runtime.run_check(
+        request("k1", "import sys; sys.exit(0)", claims=("c-never-recorded",)),
+        verifier=declared_verifier(),
+    )
+    assert runtime.verification_attempts_for_claim("c-never-recorded") == ()
+    [refusal] = [
+        e for e in runtime.ledger.read_all() if e.kind == "claim.verification_attempt_refused"
+    ]
+    assert refusal.payload["reason"] == "unknown_claim"
+    assert refusal.payload["check_id"] == "k1"
+
+
+def test_the_same_check_is_recorded_once(tmp_path):
+    runtime = make_runtime(tmp_path)
+    claimed(runtime)
+    for _ in range(2):
+        runtime.run_check(
+            request("k1", "import sys; sys.exit(0)", claims=("c1",)), verifier=declared_verifier()
+        )
+    assert len(runtime.verification_attempts_for_claim("c1")) == 1
+
+
+def test_reopening_gives_the_same_ordered_attempt_list(tmp_path):
+    path = tmp_path / "run"
+    path.mkdir()
+    ledger = SQLiteLedger(path / "ledger.sqlite")
+    runtime = Runtime(ledger, artifact_store=FileArtifactStore(path / "artifacts", ledger))
+    claimed(runtime)
+    for check_id, script in (("k1", "import sys; sys.exit(2)"),
+                             ("k2", "import sys; sys.exit(7)"),
+                             ("k3", "import sys; sys.exit(0)")):
+        runtime.run_check(request(check_id, script, claims=("c1",)), verifier=declared_verifier())
+    before = runtime.verification_attempts_for_claim("c1")
+    ledger.close()
+
+    reopened = SQLiteLedger(path / "ledger.sqlite")
+    second = Runtime(reopened, artifact_store=FileArtifactStore(path / "artifacts", reopened))
+    after = second.verification_attempts_for_claim("c1")
+    assert [a.check_id for a in after] == ["k1", "k2", "k3"]
+    assert [a.verdict for a in after] == ["INCONCLUSIVE", "ERROR", "PASS"]
+    assert after == before
+    reopened.close()
+
+
+def test_an_errored_attempt_is_absent_from_the_evidence_projection(tmp_path):
+    """Visible as an attempt, invisible as evidence: the two never merge."""
+    from codeai.evidence import CHECK, SUPPORTS, EvidenceRecord, EvidenceRefused
+
+    runtime = make_runtime(tmp_path)
+    runtime.run_check(
+        request("k-error", "import sys; sys.exit(7)", claims=("c1",)), verifier=declared_verifier()
+    )
+    # A Stage-18 claim would still refuse an errored check as evidence...
+    with pytest.raises(EvidenceRefused) as refused:
+        runtime.record_claim_evidence(
+            EvidenceRecord("ev", "c1", CHECK, SUPPORTS, "reviewer", check_id="k-error")
+        )
+    assert "check_errored" in refused.value.reasons

@@ -72,7 +72,9 @@ ARTIFACT_TARGET = re.compile(r"^artifact:sha256:([0-9a-f]{64})$")
 
 CHECK_REQUESTED = "check.requested"
 CHECK_COMPLETED = "check.completed"
-CLAIM_CHECK_INCONCLUSIVE = "claim.check_inconclusive"
+CLAIM_VERIFICATION_ATTEMPTED = "claim.verification_attempted"
+CLAIM_ATTEMPT_REFUSED = "claim.verification_attempt_refused"
+CLAIM_KINDS = ("claim.recorded", "claim.extracted", "claim.created")
 
 _VERDICTS = frozenset(str(value) for value in CheckVerdict)
 
@@ -489,11 +491,14 @@ def apply_verification_to_claims(
 ) -> None:
     """Scoped promotion: only claims the check named, and only what it settled.
 
-    PASS and FAIL move the claims the check targeted. INCONCLUSIVE records that
-    the attempt happened and settled nothing, which is a fact worth keeping and
-    not a change of status. ERROR records nothing against the claim at all:
+    PASS and FAIL move the claims the check targeted. INCONCLUSIVE and ERROR move
+    nothing:
 
         verification failed  !=  claim disproved
+
+    That an attempt was made at all -- whatever its outcome -- is recorded
+    separately by record_verification_attempts, because "no evidence was
+    produced" and "no attempt is discoverable" are different facts.
     """
     if not request.claim_ids:
         return
@@ -530,35 +535,148 @@ def apply_verification_to_claims(
                     correlation_id=request.task_id,
                 )
             )
-    elif verdict == CheckVerdict.INCONCLUSIVE:
-        for claim_id in request.claim_ids:
+    # INCONCLUSIVE and ERROR move nothing. That the attempt happened is recorded
+    # by the attempt trace, which is a relation rather than a second verdict.
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationAttempt:
+    """One verification attempted against one claim, resolved from the check.
+
+    The claim side records only *that* the attempt happened. Verdict, binding
+    and reason are read from the check stream, which stays the single source of
+    truth for them: a claim-side copy could later disagree with the check it
+    describes, and then neither could be believed.
+    """
+
+    claim_id: str
+    check_id: str
+    attempt_event_id: str
+    check_completed_event_id: str | None
+    verdict: str | None
+    binding_status: str | None
+    artifact_binding_status: str | None
+    reason: str | None
+
+    @property
+    def settled_the_claim(self) -> bool:
+        """PASS and FAIL bear on the claim; INCONCLUSIVE and ERROR do not."""
+        return self.verdict in (CheckVerdict.PASS, CheckVerdict.FAIL)
+
+
+def _claim_is_recorded(runtime: Runtime, claim_id: str) -> bool:
+    for event in runtime.ledger.events_by_kind(CLAIM_KINDS):
+        if event.stream_id == str(claim_id) or str(event.payload.get("claim_id")) == str(claim_id):
+            return True
+    return False
+
+
+def record_verification_attempts(
+    runtime: Runtime, request: CheckRequest, completed_event: Event
+) -> None:
+    """Make every attempt navigable from the claim it was aimed at.
+
+    An attempt is recorded whatever the outcome, including an ERROR where the
+    verifier was never invoked: "no evidence was produced" and "no attempt is
+    discoverable" are different facts, and the audit found them collapsed.
+
+    This records no verdict. It is a relation, not a second opinion.
+    """
+    if not request.claim_ids:
+        return
+    already = {
+        (str(event.payload.get("claim_id")), str(event.payload.get("check_id")))
+        for event in runtime.ledger.events_by_kind((CLAIM_VERIFICATION_ATTEMPTED,))
+    }
+    for claim_id in request.claim_ids:
+        key = (str(claim_id), str(request.check_id))
+        if key in already:
+            continue
+        if not _claim_is_recorded(runtime, str(claim_id)):
+            # Refuse rather than leave a relation pointing at nothing.
             runtime.ledger.append(
                 Event.create(
                     stream_id=str(claim_id),
-                    kind=CLAIM_CHECK_INCONCLUSIVE,
+                    kind=CLAIM_ATTEMPT_REFUSED,
                     actor_id="verifier",
                     payload={
                         "claim_id": str(claim_id),
-                        "check_id": result.check_id,
-                        "verdict": verdict,
-                        "inconclusive_reason": result.inconclusive_reason,
-                        "details": (
-                            "the check ran and could not settle this claim; "
-                            "its status is unchanged"
-                        ),
+                        "check_id": request.check_id,
+                        "reason": "unknown_claim",
                         "version": VERIFICATION_V1,
                     },
+                    causation_id=completed_event.event_id,
                     correlation_id=request.task_id,
                 )
             )
+            continue
+        runtime.ledger.append(
+            Event.create(
+                stream_id=str(claim_id),
+                kind=CLAIM_VERIFICATION_ATTEMPTED,
+                actor_id="verifier",
+                payload={
+                    "claim_id": str(claim_id),
+                    "check_id": request.check_id,
+                    "check_completed_event_id": completed_event.event_id,
+                    "version": VERIFICATION_V1,
+                },
+                causation_id=completed_event.event_id,
+                correlation_id=request.task_id,
+            )
+        )
+        already.add(key)
+
+
+def verification_attempts_for_claim(
+    runtime: Runtime, claim_id: str
+) -> tuple[VerificationAttempt, ...]:
+    """Every verification attempted against this claim, in the order recorded.
+
+    Navigable from the claim, resolved from the checks. An attempt whose check
+    ended in ERROR appears here and nowhere in the claim's evidence.
+    """
+    completed = {
+        event.stream_id: event
+        for event in runtime.ledger.events_by_kind((CHECK_COMPLETED,))
+    }
+    attempts = []
+    for event in runtime.ledger.events_by_kind((CLAIM_VERIFICATION_ATTEMPTED,)):
+        if str(event.payload.get("claim_id")) != str(claim_id):
+            continue
+        check_id = str(event.payload.get("check_id"))
+        check = completed.get(check_id)
+        payload = check.payload if check is not None else {}
+        attempts.append(
+            VerificationAttempt(
+                claim_id=str(claim_id),
+                check_id=check_id,
+                attempt_event_id=event.event_id,
+                check_completed_event_id=check.event_id if check is not None else None,
+                verdict=payload.get("verdict"),
+                binding_status=payload.get("binding_status"),
+                artifact_binding_status=payload.get("artifact_binding_status"),
+                reason=payload.get("error") or payload.get("inconclusive_reason"),
+            )
+        )
+    return tuple(attempts)
 
 
 def inconclusive_checks_for_claim(runtime: Runtime, claim_id: str) -> tuple[dict[str, Any], ...]:
-    """Every check that ran against this claim and could not settle it."""
+    """Attempts that ran against this claim and could not settle it.
+
+    Derived from the attempt trace and the checks themselves, so it cannot
+    disagree with them.
+    """
     return tuple(
-        event.payload
-        for event in runtime.ledger.events_by_kind((CLAIM_CHECK_INCONCLUSIVE,))
-        if str(event.payload.get("claim_id")) == str(claim_id)
+        {
+            "claim_id": attempt.claim_id,
+            "check_id": attempt.check_id,
+            "verdict": attempt.verdict,
+            "inconclusive_reason": attempt.reason,
+        }
+        for attempt in verification_attempts_for_claim(runtime, claim_id)
+        if attempt.verdict == CheckVerdict.INCONCLUSIVE
     )
 
 
@@ -597,8 +715,11 @@ def run_check(
         # A check that may not run produced no verification result at all.
         refused = _error(request, f"governance refused: {standing.reason}",
                          started_at=now_utc(), completed_at=now_utc())
-        record_verification(runtime, request, bind_check_target(runtime, request), refused,
-                            request_event, verifier, None)
+        completed_event = record_verification(
+            runtime, request, bind_check_target(runtime, request), refused,
+            request_event, verifier, None,
+        )
+        record_verification_attempts(runtime, request, completed_event)
         return refused
 
     binding = bind_check_target(runtime, request)
@@ -606,8 +727,9 @@ def run_check(
         artifact_binding, prepared = bind_check_artifact(runtime, request, workdir)
         result = execute_verification(runtime, prepared, binding, verifier, artifact_binding)
         result = finalize_verification(runtime, result, binding, artifact_binding)
-    record_verification(
+    completed_event = record_verification(
         runtime, request, binding, result, request_event, verifier, artifact_binding
     )
+    record_verification_attempts(runtime, request, completed_event)
     apply_verification_to_claims(runtime, request, result)
     return result

@@ -115,10 +115,12 @@ from .governance import (
 )
 from .process_state import PROCESS_STATE_V1, ProcessState, project_process_state, state_snapshot
 from .verification import (
+    VerificationAttempt,
     VerificationBinding,
     apply_verification_to_claims,
     bind_check_target,
     inconclusive_checks_for_claim,
+    verification_attempts_for_claim,
 )
 from .verification import run_check as _run_check
 from .authority import (
@@ -555,6 +557,10 @@ class Runtime:
     def inconclusive_checks_for_claim(self, claim_id: str) -> tuple[dict[str, object], ...]:
         """Checks that ran against this claim and settled nothing."""
         return inconclusive_checks_for_claim(self, claim_id)
+
+    def verification_attempts_for_claim(self, claim_id: str) -> tuple[VerificationAttempt, ...]:
+        """Every verification attempted against this claim, whatever came of it."""
+        return verification_attempts_for_claim(self, claim_id)
 
     # ------------------------------------------------------------------
     # Task acceptance: the only path to task.completed

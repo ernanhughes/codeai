@@ -701,22 +701,29 @@ def probe_h_verification_to_claim(stack) -> Probe:
     p.see(f"ERROR ({errored.error[:40]}...) -> status {claims['c-error'].status}")
 
     # The registered question: can a later reader find the errored attempt from the claim?
-    claim_side = {
-        "claim-scoped inconclusive index": len(b.runtime.inconclusive_checks_for_claim("c-error")),
-        "events in the claim stream": len([
-            e for e in b.ledger.read_all() if e.stream_id == "c-error"
-        ]),
+    attempts = b.runtime.verification_attempts_for_claim("c-error")
+    p.see(f"attempts discoverable from the errored claim: "
+          f"{[(a.check_id, a.verdict, a.settled_the_claim) for a in attempts]}")
+    all_attempts = {
+        claim_id: [(a.check_id, a.verdict) for a in b.runtime.verification_attempts_for_claim(claim_id)]
+        for claim_id in ("c-pass", "c-fail", "c-maybe", "c-error")
     }
-    ledger_scan = [
-        e.stream_id for e in b.ledger.events_by_kind(("check.requested",))
-        if "c-error" in (e.payload.get("claim_ids") or ())
-    ]
-    p.see(f"from the claim side: {claim_side}")
-    p.see(f"by scanning check.requested for the claim id: {ledger_scan}")
-    p.classification = "DERIVED"
-    p.note = ("The attempt is reconstructable only by scanning every check.requested for the claim "
-              "id. Nothing on the claim records that a verification of it errored, so 'no negative "
-              "evidence' and 'no claim-side trace' are currently the same thing.")
+    p.see(f"every outcome is navigable from its claim: {all_attempts}")
+    settled = {
+        claim_id: [a.settled_the_claim for a in b.runtime.verification_attempts_for_claim(claim_id)]
+        for claim_id in ("c-pass", "c-fail", "c-maybe", "c-error")
+    }
+    p.see(f"and only PASS/FAIL bear on it: {settled}")
+    trace_payload = [
+        sorted(e.payload) for e in b.ledger.events_by_kind(("claim.verification_attempted",))
+    ][0]
+    p.see(f"the claim-side record holds a reference, not a verdict: {trace_payload}")
+    p.classification = "ENFORCED" if attempts and attempts[0].verdict == "ERROR" else "DERIVED"
+    p.note = ("Baseline (f0c730b): the attempt was reconstructable only by scanning every "
+              "check.requested for the claim id, so 'no negative evidence' and 'no claim-side "
+              "trace' were the same thing. After W1-R5 every attempt is navigable from the claim "
+              "and carries no verdict of its own: the check stream stays the single source of "
+              "truth for what was found.")
     b.close()
     return p
 
