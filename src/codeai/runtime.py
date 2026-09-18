@@ -434,6 +434,10 @@ class Runtime:
                         "adapter": request.effective_adapter_id(),
                         "capability": str(request.capability),
                         "started_at": started_at,
+                        # The runtime own reading before the adapter acts, so a
+                        # later reader can compare it with the completion rather
+                        # than take the actor word for the effect.
+                        "state_hash_before": current_state,
                         "version": ACTION_RECOVERY_V1,
                     },
                     causation_id=request_event.event_id,

@@ -1,6 +1,9 @@
 """The Wave 1 composition audit, pinned.
 
-These assertions record what the audit *observed* at 11fedcd, including the gaps.
+These assertions record what the audit *observed*, including the gaps. The
+frozen baseline is 11fedcd (result: experiments/W1-composition-results.json).
+Where a repair has landed, the assertion moves and names the repair; the frozen
+result never moves.
 Several of them assert behaviour that is wrong and known to be wrong: that is the
 point of a frozen baseline. When a repair lands, the failing assertion here is
 the signal to write a new audit entry citing the old one -- never to edit the
@@ -63,7 +66,7 @@ def test_the_happy_path_crosses_every_seam_and_survives_a_reopen(audit):
         ("A", "ENFORCED"),       # directive -> action authority
         ("B", "RECORDED"),       # directive -> acceptance authority   (gap)
         ("C", "CONVENTIONAL"),   # decision -> execution               (gap)
-        ("D", "RECORDED"),       # report -> effect state              (gap)
+        ("D", "DERIVED"),        # report -> effect state   (gap 1, repaired by W1-R1)
         ("E", "ENFORCED"),       # effect -> reconciliation
         ("F", "ENFORCED"),       # observed state -> binding
         ("G", "ENFORCED"),       # command -> verdict semantics
@@ -98,13 +101,17 @@ def test_gap_b_the_recorded_decision_does_not_gate_the_effect(probes):
     assert "references a decision: False" in observed
 
 
-def test_gap_c_a_worker_report_alone_makes_the_effect_observed(probes):
-    """Chapter 19's question, answered by the worker rather than by the world."""
+def test_gap_c_repaired_a_worker_report_alone_no_longer_observes_the_effect(probes):
+    """Audit gap 1, repaired by W1-R1 (experiments/W1-R1-effect-observation.md).
+
+    Baseline at f0c730b: 'projected effect state: observed' from the report alone.
+    """
     observed = " | ".join(probes["D"]["observed"])
     assert "changed nothing: state hash moved = False" in observed
-    assert "projected effect state: observed" in observed
+    assert "projected effect state: unknown" in observed
     assert "identical: True" in observed
-    assert "a check of the intended post-condition: FAIL" in observed
+    assert "effect_state trusts the report alone: False" in observed
+    assert probes["D"]["classification"] == "DERIVED"
 
 
 def test_gap_d_acceptance_trusts_the_artifact_label_on_the_check(probes):

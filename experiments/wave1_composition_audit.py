@@ -494,12 +494,16 @@ def probe_d_report_vs_observation(stack) -> Probe:
     )
     p.see(f"a check of the intended post-condition: {verdict.verdict} "
           f"(binding {verdict.binding_status})")
-    p.see("so: effect_state says OBSERVED while verification says FAIL")
-    p.classification = "RECORDED"
-    p.note = ("Seam 1 separates result status from effect state everywhere except the SUCCEEDED "
-              "branch, where effect OBSERVED is derived from the worker's report. The runtime holds "
-              "the contradicting evidence -- identical before and after state hashes -- and does not "
-              "consult it. Only a separately requested verification catches the lie.")
+    trusted_the_report = str(state.effect_state) == "observed"
+    p.see(f"effect_state trusts the report alone: {trusted_the_report}")
+    p.classification = "RECORDED" if trusted_the_report else "DERIVED"
+    p.note = (
+        "Baseline (f0c730b): seam 1 separated result status from effect state everywhere except the "
+        "SUCCEEDED branch, where OBSERVED came from the worker's report while the runtime held two "
+        "identical readings it never compared. After W1-R1 the effect state is derived from those "
+        "readings; the report itself is still RECORDED, which is correct -- it is the actor's claim, "
+        "and it is kept as one."
+    )
     b.close()
     return p
 
@@ -928,6 +932,8 @@ def main() -> dict[str, object]:
 
 if __name__ == "__main__":
     output = main()
-    destination = Path(__file__).resolve().parent / "W1-composition-results.json"
+    destination = Path(__file__).resolve().parent / (
+        sys.argv[1] if len(sys.argv) > 1 else "W1-composition-results.json"
+    )
     destination.write_text(json.dumps(output, indent=2, sort_keys=False), encoding="utf-8")
     print(f"\nfrozen: {destination}")

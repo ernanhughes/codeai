@@ -71,6 +71,42 @@ ordering argument, not a cosmetic fix. Full suite: 476 passed.
 
 `examples/applied_ai/ch22_action_recovery.py`, asserted by `tests/test_examples.py`.
 
+## Repair W1-R1: the effect state stopped trusting the actor
+
+The Wave 1 composition audit (gap 1) found the SUCCEEDED branch deriving effect
+OBSERVED from the worker's report, while the runtime held two identical state readings it never
+compared. Result status and effect state were separate dimensions everywhere except the one place a
+lie would show.
+
+Three dimensions now, not two:
+
+```text
+result status      what the actor said       SUCCEEDED / FAILED / DENIED
+state observation  what the runtime read     CHANGED / UNCHANGED / UNAVAILABLE
+effect state       what the record supports  NONE / REPORTED / UNKNOWN / OBSERVED
+```
+
+`action.execution_started` carries `state_hash_before`: the reading the runtime already took for the
+precondition check, now recorded rather than discarded. `action.completed` already carried the
+reading after. The projection compares them:
+
+| Report | Observation | Effect | Next |
+|---|---|---|---|
+| succeeded | CHANGED | OBSERVED | none |
+| succeeded | UNCHANGED | **UNKNOWN** | reconcile |
+| succeeded | UNAVAILABLE | **REPORTED** | none |
+| failed after start | any | UNKNOWN | reconcile |
+| failed before start | any | NONE | fix inputs |
+| denied | any | NONE | none |
+
+`REPORTED` is new and deliberately weaker than `OBSERVED`: an effect was claimed and nothing
+corroborates it, which is not the same as UNKNOWN, where something contradicts it.
+
+**CHANGED does not mean the intended effect occurred.** It means the observed scope is not what it
+was. A worker that writes the wrong thing yields OBSERVED. That is verification's question, and
+`examples/applied_ai/ch19_effect_observation.py` shows both workers reaching the same effect state
+and opposite verdicts.
+
 ## What it still does not establish
 
 1. **No atomicity.** The adapter acts and the ledger hears afterwards. The seam makes the gap
@@ -79,9 +115,14 @@ ordering argument, not a cosmetic fix. Full suite: 476 passed.
    submit the same key and both execute.
 3. **Reconciliation evidence is unvalidated.** `evidence_refs` are strings the caller supplies. The
    runtime records who said what, not whether it is true.
-4. **Effect scope is still the resolver's.** `observed_state_hash` covers whatever the configured
-   resolver reads. An effect outside it is invisible here as it was before.
+4. **Effect scope is still the resolver's.** Both readings cover whatever the configured resolver
+   reads. An effect outside it is invisible, which is exactly why UNCHANGED projects UNKNOWN rather
+   than "nothing happened".
 5. **No compensation.** `EFFECT_CONFIRMED` records that the world changed; undoing it is not a
    runtime operation.
 6. **Pre-seam records stay unknown forever** unless someone reconciles them.
 7. **Single writer.** Unchanged.
+8. **The two readings are not a transaction.** Anything else may have moved the scope between them,
+   so CHANGED attributes the change to this action only by proximity.
+9. **`REPORTED` cannot be reconciled.** Reconciliation accepts only UNKNOWN, so a deployment with
+   no resolver stays at the actor's word with no way to record later evidence about it.
