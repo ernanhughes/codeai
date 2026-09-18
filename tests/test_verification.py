@@ -590,3 +590,29 @@ def test_the_two_bindings_are_independent(tmp_path):
     # The state moved; the artifact is still exactly what it was.
     assert second.verdict == CheckVerdict.ERROR
     assert (second.binding_status, second.artifact_binding_status) == ("mismatch", "bound")
+
+
+def test_artifact_binding_is_not_artifact_adequacy(tmp_path):
+    """BOUND says which bytes were supplied. It says nothing about the check.
+
+    Both of these are legitimately BOUND: one examines the artifact, the other
+    is handed it and ignores it. The runtime claims only the first thing.
+    """
+    runtime = make_runtime(tmp_path)
+    ref = stored(runtime)
+    meaningful = runtime.run_check(
+        artifact_check("k-real", ref, script=READS_IT), verifier=declared_verifier()
+    )
+    ignores_it = runtime.run_check(
+        artifact_check("k-lazy", ref, script="import sys; sys.exit(0)"),
+        verifier=declared_verifier(),
+    )
+    assert meaningful.artifact_binding_status == "bound"
+    assert ignores_it.artifact_binding_status == "bound"
+    assert (meaningful.verdict, ignores_it.verdict) == (CheckVerdict.PASS, CheckVerdict.PASS)
+    # The record establishes supply, not scrutiny. Whether the criterion was the
+    # right one, and whether the command applied it, is verification adequacy,
+    # which this seam deliberately does not address.
+    completed = {e.stream_id: e.payload for e in runtime.ledger.events_by_kind(("check.completed",))}
+    for check_id in ("k-real", "k-lazy"):
+        assert completed[check_id]["artifact_binding"]["materialized"] is True

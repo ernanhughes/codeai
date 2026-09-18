@@ -95,9 +95,19 @@ PASS on the accepted artifact      -> completed
 
 ## What this repair does not do
 
-1. **It establishes what the check was given, never what it read.** A command that receives
-   `{artifact}` and ignores it still passes. The same shape as "the state binding is a reading, not a
-   lock", and the same honest limit.
+1. **Artifact binding is not artifact adequacy.** `BOUND` means the intended artifact was resolved,
+   integrity-checked and made available through the declared verifier interface. It does not mean the
+   verifier used a single byte of it. Both of these are legitimately BOUND:
+
+   ```text
+   grep expected-token {artifact}     a meaningful check
+   python verifier.py {artifact}      a verifier that ignores argv[1] and returns 0
+   ```
+
+   The runtime claims only "this is the artifact that was supplied". Pushing past that generically
+   means sandboxing, syscall tracing or instrumented execution — a different problem, and one this
+   seam does not pretend to solve. Pinned by
+   `test_artifact_binding_is_not_artifact_adequacy`.
 2. **The materialized copy is transient.** It lives for the duration of the check; the artifact
    itself lives in the store. Nothing records the copy's path as durable evidence.
 3. **One artifact per check.** A check that should examine several has no way to say so.
