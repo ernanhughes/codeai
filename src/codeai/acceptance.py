@@ -17,6 +17,28 @@ the record says otherwise.
 This resolves authority from the durable record. It does not authenticate the
 acceptor: ``actor_id`` remains attribution, not identity.
 
+An acceptance also says what it rests on, and the two bases are different claims:
+
+    artifact / check basis   I accept this verified result
+    effect / action basis    I accept this verified result as the outcome of
+                             action A
+
+The second is optional, because a task may legitimately accept an artifact
+without caring how it was produced -- imported, hand-written, already correct.
+Forcing a fictional action into that history to satisfy a schema would be worse
+than the gap it closes. But an acceptance that *does* name an action has that
+relationship enforced rather than believed:
+
+    action.completed
+          -> the runtime's own observation H
+          -> a cited check bound to H
+          -> PASS
+          -> acceptance naming that action
+
+What that establishes is a binding, not a proof of cause: action A was followed
+by runtime observation H, and the accepted verification examined H. The readings
+either side of an effect are proximity, not a transaction (Chapter 19).
+
 A task projects as completed only when:
 
 1. an acceptor whose authority grants ``Capability.ACCEPT`` submits an
@@ -109,6 +131,9 @@ class AcceptanceRequest:
     source_attempt_id: str
     source_interpretation_id: str
     check_ids: tuple[str, ...] = ()
+    # Optional: the action this acceptance claims produced the accepted state.
+    # Naming one invites enforcement; naming none is not a silent claim of any.
+    effect_action_id: str | None = None
     policy_version: str = TASK_ACCEPTANCE_V1
 
     def identity(self) -> dict[str, Any]:
@@ -180,6 +205,7 @@ def accept_task(
             "authority_basis": decision.basis_payload(),
             "caller_claimed_capabilities": _claimed(authority),
             "check_completed_event_ids": check_event_ids,
+            "acceptance_basis": _basis_payload(runtime, request),
         },
         correlation_id=request.task_id,
     )
@@ -281,11 +307,83 @@ def _validate(runtime: Runtime, request: AcceptanceRequest) -> tuple[list[str], 
     elif request.criteria_sha256 not in definitions:
         reasons.append("criteria_mismatch")
 
+    reasons.extend(_validate_effect_basis(runtime, request))
     reasons.extend(_validate_source(runtime, request))
     reasons.extend(_validate_artifact(runtime, request))
     check_reasons, check_event_ids = _validate_checks(runtime, request)
     reasons.extend(check_reasons)
     return reasons, check_event_ids
+
+
+def effect_basis(runtime: Runtime, request: AcceptanceRequest) -> dict[str, Any] | None:
+    """What the acceptance rests on where an action is claimed, or None."""
+    if not request.effect_action_id:
+        return None
+    from .actions import EffectState, project_action_state
+
+    events = runtime.ledger.read_all()
+    state = project_action_state(events, str(request.effect_action_id))
+    completed = next(
+        (
+            event
+            for event in events
+            if event.kind == "action.completed"
+            and str(event.payload.get("action_id")) == str(request.effect_action_id)
+        ),
+        None,
+    )
+    checks = {
+        event.stream_id: event
+        for event in runtime.ledger.events_by_kind(("check.completed",))
+    }
+    observed = state.observed_state_hash if state is not None else None
+    def examined_that_state(check_id: str) -> bool:
+        event = checks.get(check_id)
+        if event is None or observed is None:
+            return False
+        payload = event.payload
+        return (
+            payload.get("observed_target_state_hash") == observed
+            and str(payload.get("verdict")) == "PASS"
+        )
+
+    matching = [c for c in sorted(set(request.check_ids)) if examined_that_state(c)]
+    return {
+        "action_id": str(request.effect_action_id),
+        "task_id": state.task_id if state is not None else None,
+        "effect_state": state.effect_state if state is not None else None,
+        "result_status": state.result_status if state is not None else None,
+        "observed_state_hash": observed,
+        "action_completed_event_id": completed.event_id if completed is not None else None,
+        "checks_examining_that_state": matching,
+        "state": state,
+        "effect_observed": (
+            state is not None and state.effect_state == EffectState.OBSERVED.value
+        ),
+    }
+
+
+def _validate_effect_basis(runtime: Runtime, request: AcceptanceRequest) -> list[str]:
+    """An acceptance that claims an action must be able to stand behind it.
+
+    Nothing here is required of an acceptance that claims no action: that is the
+    ordinary artifact-and-check basis, and it is left exactly as it was.
+    """
+    basis = effect_basis(runtime, request)
+    if basis is None:
+        return []
+    action_id = basis["action_id"]
+    if basis["state"] is None:
+        return [f"effect_action_unknown:{action_id}"]
+    if str(basis["task_id"]) != str(request.task_id):
+        return [f"effect_action_wrong_task:{action_id}"]
+    if not basis["effect_observed"]:
+        # UNKNOWN, REPORTED and NONE all mean the same thing here: the record
+        # does not establish that this action produced anything to accept.
+        return [f"effect_action_not_observed:{action_id}:{basis['effect_state']}"]
+    if not basis["checks_examining_that_state"]:
+        return [f"effect_action_state_unchecked:{action_id}"]
+    return []
 
 
 def _validate_source(runtime: Runtime, request: AcceptanceRequest) -> list[str]:
@@ -462,6 +560,33 @@ def _append_completion(runtime: Runtime, acceptance: Event) -> Event:
     )
     runtime.ledger.append(event)
     return event
+
+
+def _basis_payload(runtime: Runtime, request: AcceptanceRequest) -> dict[str, Any]:
+    """What this acceptance rested on, in a form a later reader can re-derive.
+
+    An acceptance with no effect basis says so explicitly, so absence is a
+    recorded fact rather than something a reader has to infer from silence.
+    """
+    basis = effect_basis(runtime, request)
+    if basis is None:
+        return {"kind": "artifact_check", "effect": None, "version": TASK_ACCEPTANCE_V1}
+    return {
+        "kind": "artifact_check_and_effect",
+        "effect": {
+            "action_id": basis["action_id"],
+            "action_completed_event_id": basis["action_completed_event_id"],
+            "observed_state_hash": basis["observed_state_hash"],
+            "effect_state": basis["effect_state"],
+            "checks_examining_that_state": basis["checks_examining_that_state"],
+            # What this is, said plainly, so no later reader promotes it.
+            "establishes": (
+                "the action was followed by this runtime observation, and an "
+                "accepted check examined it; not that the action caused it"
+            ),
+        },
+        "version": TASK_ACCEPTANCE_V1,
+    }
 
 
 def _claimed(authority: Authority | None) -> list[str]:

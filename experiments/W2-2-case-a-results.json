@@ -1,0 +1,71 @@
+{
+  "findings": [
+    {
+      "shape": "one action, bound check",
+      "check_observations": [
+        "1235f8f435b1d16f7aac442351f2e29ff1bd2b74652392c4accb5ec5565973da"
+      ],
+      "candidate_actions": [
+        "a1"
+      ],
+      "derivable": true,
+      "reason": "exactly one action observed the checked state"
+    },
+    {
+      "shape": "a second action that changed nothing",
+      "check_observations": [
+        "1235f8f435b1d16f7aac442351f2e29ff1bd2b74652392c4accb5ec5565973da"
+      ],
+      "candidate_actions": [
+        "a1",
+        "a2"
+      ],
+      "derivable": false,
+      "reason": "2 actions observed the checked state"
+    },
+    {
+      "shape": "another task's action on the same state",
+      "check_observations": [
+        "1235f8f435b1d16f7aac442351f2e29ff1bd2b74652392c4accb5ec5565973da"
+      ],
+      "candidate_actions": [
+        "a-other",
+        "a1"
+      ],
+      "derivable": false,
+      "reason": "2 actions observed the checked state"
+    },
+    {
+      "shape": "the action replayed under its key",
+      "check_observations": [
+        "1235f8f435b1d16f7aac442351f2e29ff1bd2b74652392c4accb5ec5565973da"
+      ],
+      "candidate_actions": [
+        "a1",
+        "a1-again"
+      ],
+      "derivable": false,
+      "reason": "2 actions observed the checked state"
+    },
+    {
+      "shape": "an acceptance-eligible check with no state binding",
+      "check_observations": [
+        null
+      ],
+      "candidate_actions": [],
+      "derivable": false,
+      "reason": "no check carried a runtime observation"
+    },
+    {
+      "shape": "the world moved after the action",
+      "check_observations": [
+        "e1bda2a47ce2d3ad54c8cd46315a995b55f4acf8f47a56068ccc297e7d45247c"
+      ],
+      "candidate_actions": [],
+      "derivable": false,
+      "reason": "no action observed the checked state"
+    }
+  ],
+  "derivable": 1,
+  "shapes": 6
+}
