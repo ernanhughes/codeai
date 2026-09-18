@@ -94,17 +94,12 @@ A routing prompt is short, so the cheap column is reachable with a small model; 
 nevertheless requires **two** models (primary and alternate) for its model-sensitivity dimension, and
 the alternate is the one most likely to be dearer.
 
-This is a scope question, not a threshold question, and it is the author's to settle. The options, as
-they stand:
+This is a scope question, not a threshold question. **Settled: run R1 only.** 480 model calls,
+~$0.24, the experiment the design says alone feeds the falsifier. R2 and C are deferred to a possible
+second authorization, and their absence will be reported as scope rather than as a result. The
+ceiling was not raised.
 
-1. **Run R1 only, first.** 480 model calls, ~$0.24 at the cheap price — inside the checkpoint. R1 is
-   the load-bearing experiment: the design says it *alone* feeds the §0 falsifier. R2 and C would be
-   deferred to a second authorization, and their absence reported as scope, not as a result.
-2. **Raise the cap** to cover the full 1,580 calls at the actual price of the chosen pair.
-3. **Choose both models from the cheap tier**, accepting that "model sensitivity" then means
-   sensitivity across two small models rather than across a capability gap.
-
-What is *not* an option: reducing repeats. Repeat counts feed the variance threshold (median flip
+What was *not* available: reducing repeats. Repeat counts feed the variance threshold (median flip
 ≤10%, p95 ≤20%), and cutting them to fit a budget would quietly change a preregistered criterion.
 
 ## Instrumentation evidence, at $0.00
