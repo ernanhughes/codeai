@@ -125,6 +125,12 @@ from .verification import (
 from .verification import run_check as _run_check
 from .authority import (
     AUTHORITY_RESOLUTION_V1,
+    AUTHORITY_TRANSITION_V1,
+    TRANSITION_REFUSED,
+    TRANSITIONED,
+    AuthorityTransitionRefused,
+    TransitionSource,
+    resolve_supersession,
     AuthorizationDecision,
     DirectiveAuthorityStanding,
     resolve_directive_authority,
@@ -579,6 +585,115 @@ class Runtime:
         when authority cannot be established or any reference fails validation.
         """
         return _accept_task(self, request, authority=authority)
+
+    def transition_authority(
+        self,
+        previous_directive_id: str,
+        directive: Directive,
+        *,
+        actor_id: str,
+        reason: str,
+        source: str = TransitionSource.HUMAN_INTERVENTION.value,
+    ) -> DirectiveAuthorityStanding:
+        """Record that authority changed, and which directive is in force now.
+
+        Directives are immutable. This registers ``directive`` as the successor
+        of ``previous_directive_id`` and records the change; the predecessor is
+        left exactly as it was, so what was true then stays readable.
+
+        A transition is not a delegation. A child may only narrow its parent; a
+        successor may add or remove capabilities, because it records a new
+        external decision rather than a delegated child claiming powers its
+        parent lacked. For that reason the successor is registered as a root:
+        it inherits nothing, and it is bound by nothing it did not declare.
+
+        What this establishes: an explicit authority change entered the durable
+        process here, attributed to this actor. Not that the actor was entitled
+        to make it.
+        """
+        previous = resolve_directive_authority(self.ledger.read_all(), previous_directive_id)
+        if not previous.resolvable:
+            self._refuse_transition(
+                previous_directive_id, directive.directive_id, actor_id, reason, source,
+                f"the directive being superseded cannot be resolved: {previous.reason}",
+            )
+        if previous.effective_directive_id != str(previous_directive_id):
+            self._refuse_transition(
+                previous_directive_id, directive.directive_id, actor_id, reason, source,
+                f"directive {previous_directive_id} has already been superseded by "
+                f"{previous.effective_directive_id}; supersede that one instead",
+            )
+        if directive.parent_directive_id is not None:
+            self._refuse_transition(
+                previous_directive_id, directive.directive_id, actor_id, reason, source,
+                "a superseding directive declares its own authority and takes no parent; "
+                "narrowing under a parent is delegation, not a transition",
+            )
+        if not reason:
+            self._refuse_transition(
+                previous_directive_id, directive.directive_id, actor_id, reason, source,
+                "an authority transition must record why",
+            )
+
+        opened = self.open_directive(directive, actor_id=actor_id)
+        self.ledger.append(
+            Event.create(
+                stream_id=str(previous_directive_id),
+                kind=TRANSITIONED,
+                actor_id=actor_id,
+                payload={
+                    "previous_directive_id": str(previous_directive_id),
+                    "new_directive_id": directive.directive_id,
+                    "actor_id": actor_id,
+                    "source": str(source),
+                    "reason": reason,
+                    "previous_effective_capabilities": list(previous.effective_capabilities),
+                    "new_effective_capabilities": sorted(
+                        str(c) for c in directive.authority.capabilities
+                    ),
+                    "previous_basis_event_ids": list(previous.basis_event_ids),
+                    "new_directive_event_id": opened.event_id,
+                    "version": AUTHORITY_TRANSITION_V1,
+                },
+                causation_id=opened.event_id,
+                correlation_id=str(previous_directive_id),
+            )
+        )
+        return self.directive_authority(previous_directive_id)
+
+    def _refuse_transition(
+        self, previous_id: str, new_id: str, actor_id: str, reason: str, source: str,
+        refusal: str,
+    ) -> None:
+        """Append the refusal, then raise: a refused intervention is evidence."""
+        self.ledger.append(
+            Event.create(
+                stream_id=str(previous_id),
+                kind=TRANSITION_REFUSED,
+                actor_id=actor_id,
+                payload={
+                    "previous_directive_id": str(previous_id),
+                    "new_directive_id": new_id,
+                    "actor_id": actor_id,
+                    "source": str(source),
+                    "reason": reason,
+                    "refusal": refusal,
+                    "version": AUTHORITY_TRANSITION_V1,
+                },
+                correlation_id=str(previous_id),
+            )
+        )
+        raise AuthorityTransitionRefused(refusal)
+
+    def authority_history(self, directive_id: str) -> tuple[dict[str, object], ...]:
+        """Every recorded authority transition for this directive, oldest first."""
+        _, chain, _, _ = resolve_supersession(self.ledger.read_all(), str(directive_id))
+        recorded = [
+            event.payload
+            for event in self.ledger.events_by_kind((TRANSITIONED,))
+            if str(event.payload.get("previous_directive_id")) in set(chain)
+        ]
+        return tuple(recorded)
 
     def acceptance_authority(self, task_id: str):
         """Whether the record grants ACCEPT for this task, and on what basis."""

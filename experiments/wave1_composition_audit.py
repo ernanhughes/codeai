@@ -963,16 +963,38 @@ def probe_n_human_gate_and_acceptance_grant(stack) -> Probe:
         outcome = str(b.runtime.accept_task(request).status)
     except AcceptanceRejected as exc:
         outcome = f"rejected: {', '.join(exc.reasons)}"
-    p.see(f"a human answering that gate -> {outcome}")
-    p.see(f"the task ends at: {b.runtime.decide_next_for_task('t1').operation}")
-    p.see("the gate can only be opened by recording a grant, which this task cannot acquire")
-    p.classification = "ABSENT"
-    p.note = ("Not a stuck scheduler: the durable process has reached a state from which completion "
-              "is unauthorized, which is the correct result. What is absent is a legal transition "
-              "out of it. Human intervention should change authority durably and then re-project, "
-              "never bypass it -- so the missing capability is authority transition (supersession), "
-              "not an acceptance override. Delegation may only narrow; altering authority is a "
-              "different operation. Queued as BOOK-CORE/authority-transition.")
+    p.see(f"a human accepting without changing authority -> {outcome}")
+    p.see(f"the task waits at: {b.runtime.decide_next_for_task('t1').operation}")
+
+    # The legal way out: change the authority, durably, then re-project.
+    from codeai.domain import Directive as _Directive
+
+    b.runtime.transition_authority(
+        "d-root",
+        _Directive(directive_id="d-root-accept", objective="grant acceptance",
+                   success_criteria=(), budget=Budget(max_tokens=100_000),
+                   authority=Authority(frozenset({Capability.WRITE, Capability.ACCEPT}))),
+        actor_id="a-named-reviewer",
+        reason="the reviewer takes responsibility for accepting this work",
+    )
+    standing = b.runtime.acceptance_authority("t1")
+    p.see(f"after a recorded authority transition: accept granted = {standing.granted}, "
+          f"effective directive = {standing.standing.effective_directive_id}")
+    try:
+        after = str(b.runtime.accept_task(request).status)
+    except AcceptanceRejected as exc:
+        after = f"rejected: {', '.join(exc.reasons)}"
+    p.see(f"the same acceptance, under the ordinary rule -> {after}")
+    p.see(f"the task now ends at: {b.runtime.decide_next_for_task('t1').operation}")
+    p.see("the gate opened by changing authority, not by bypassing it")
+
+    p.classification = "ENFORCED" if after == "completed" else "ABSENT"
+    p.note = ("Baseline (f0c730b, and through W1-R5): the durable process reached a state from "
+              "which completion was unauthorized -- the correct result -- with no legal transition "
+              "out of it. W1-E1 adds one: a recorded authority transition supersedes the directive, "
+              "the projection moves, and acceptance is then enforced the ordinary way. Human "
+              "intervention changes authority; it does not bypass it. The actor remains "
+              "attribution, never authentication.")
     b.close()
     return p
 

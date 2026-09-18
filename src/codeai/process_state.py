@@ -67,6 +67,7 @@ class ProcessState:
 
     acceptance_required: bool
     acceptance_authority_available: bool
+    directive_effective_capabilities: tuple[str, ...]
 
     model_budget: BudgetFact
     process_budget: BudgetFact
@@ -230,6 +231,9 @@ def project_process_state(runtime: Runtime, task_id: str) -> ProcessState:
         check_satisfied=check_satisfied,
         acceptance_required=acceptance_required,
         acceptance_authority_available=acceptance_available,
+        directive_effective_capabilities=(
+            tuple(standing.effective_capabilities) if standing.resolvable else ()
+        ),
         model_budget=model_budget,
         process_budget=process_budget,
         unresolved_effects=unresolved,
@@ -251,6 +255,9 @@ def state_snapshot(state: ProcessState) -> dict[str, object]:
         "check_satisfied": state.check_satisfied,
         "acceptance_required": state.acceptance_required,
         "acceptance_authority_available": state.acceptance_authority_available,
+        # Any change to the effective grant moves this digest, so a decision
+        # taken before an authority transition cannot survive it.
+        "directive_effective_capabilities": list(state.directive_effective_capabilities),
         "model_budget": {
             "limit": state.model_budget.limit,
             "consumed": state.model_budget.consumed,
