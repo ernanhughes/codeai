@@ -8,16 +8,43 @@ falsifier (§0), thresholds (§7), arms (§3), corpus construction (§4), oracle
 What this file records: the spend authorization, the state of the artifacts, two blockers found
 before any provider was contacted, and the evidence that the instrumentation works.
 
-## Spend authorization (author, 2026-09-18)
+## Spend authorization (author, 2026-09-18, revised the same day)
 
 ```text
-hard cap          $1.00 total model spend
-checkpoint        $0.25 — instrumentation sanity only
+hard ceiling      $1.00 total model spend
+authorized now    $0.25 — the R1 tranche only, 480 model calls
 ```
 
-The checkpoint is explicitly **not** a statistical stopping rule. At it: verify accounting, verify
-paired inputs, verify the evaluator, verify no accidental context asymmetry, then continue
-unchanged. Candidate performance is not inspected there and the protocol is not altered there.
+The $0.25 is **the authorized experimental scope**, not merely an instrumentation checkpoint: run the
+preregistered R1 experiment and nothing else. R1 is load-bearing by the design's own words — it alone
+feeds the §0 falsifier — so this executes a preregistered scope rather than trimming one.
+
+Continuations are stated **now**, so that no choice after R1 can be performance-driven:
+
+| R1 outcome under the frozen falsifier | Next |
+|---|---|
+| The challenger is rejected | Stop. The router did not earn further spend |
+| Inconclusive | No promotion. Decide separately whether more evidence is scientifically worth buying |
+| The challenger is supported | Then consider funding R2 and C as confirmatory and sensitivity work |
+
+No protocol change follows R1 in any branch. Thresholds, arms, repeats and metrics are already
+frozen, and the remaining ceiling exists to make a *second authorization* possible, not to permit
+extension mid-experiment.
+
+## Freeze manifest contents (author, explicit)
+
+The manifest must record all of:
+
+```text
+corpus schema and version          scheduler policy actually executed (epistemic-v3)
+oracle version                     adjudicator identities
+case hashes                        prompt and template hashes
+model identities                   repeat counts
+promotion and falsifier thresholds
+```
+
+The v1-state / `epistemic-v3` gap is acceptable precisely because the manifest tells the truth about
+which executable policy ran.
 
 ## Blocker 1: the oracle is people, and the code enforces it
 
@@ -98,8 +125,14 @@ distractor pairs            scored per arm and variation
 distinct prompts per case   3 — the sensitivity variations are real, not aliases
 ```
 
-**A defect in the first version of this dry run, recorded because it is the point of the
-checkpoint.** The first attempt used a fake adapter with no scripted response and no model name. The
+**A defect in the first version of this dry run, now a permanent regression test.** The harness
+refuses it rather than reporting it: a model-backed arm whose execution succeeded must carry
+accounting evidence, and its absence raises *"model decision lacks accounting evidence"* instead of
+flowing through as `cost_usd: None`. A deterministic arm's `0.0` is a measured zero; a model arm's
+missing usage is an instrumentation failure. Pinned by
+`test_a_model_arm_without_usage_is_an_instrumentation_failure`.
+
+The original defect, recorded because it is the point of a checkpoint: The first attempt used a fake adapter with no scripted response and no model name. The
 pipeline ran, the verifier returned a verdict, and every model arm's cost came back `None` — the
 accounting check passed vacuously because the accounting path had never been exercised. The fixed
 version scripts the adapter exactly as the harness test does, and the prices appear. An

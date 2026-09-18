@@ -237,3 +237,38 @@ def test_draft_corpus_status():
     assert all(c.semantic_validity == "valid" for c in by_component["R1"])
     with pytest.raises(ValueError):
         validate_corpus(corpus, freeze=True)
+
+
+def test_a_model_arm_without_usage_is_an_instrumentation_failure(tmp_path, monkeypatch):
+    """Absence of accounting evidence is not zero cost.
+
+    The W2-4 dry run's first version ran the whole pipeline with an unscripted
+    fake adapter: every model arm came back cost_usd=None, and a cost assertion
+    passed while the accounting path had never executed. The harness now refuses
+    that rather than reporting it as an absent price.
+    """
+    ledger = SQLiteLedger(tmp_path / "ledger.sqlite")
+    store = FileArtifactStore(tmp_path / "artifacts", ledger)
+    runtime = Runtime(ledger, artifact_store=store)
+    actor = ActorRef("test-router", "model", "fake-provider", "gpt-4.1", "fixture-v1")
+
+    def usageless(monkeypatch):
+        adapter = fake_with_transport(monkeypatch)
+        invoke = adapter.invoke
+
+        def stripped(spec):
+            # A provider that answered without reporting usage at all.
+            return replace(invoke(spec), input_tokens=None, output_tokens=None)
+
+        monkeypatch.setattr(adapter, "invoke", stripped)
+        return adapter
+
+    routers = {name: ModelRouter(runtime, usageless(monkeypatch), actor)
+               for name in ("primary", "alternate")}
+    c = fixture_corpus()
+    o = fixture_oracle(c)
+    run(runtime, c, o, {"status": "TEST_ONLY"}, routers, run_id="no-usage", synthetic=True)
+    with pytest.raises(ValueError) as refused:
+        verify_ledger(tmp_path / "ledger.sqlite", tmp_path / "artifacts", "no-usage")
+    assert "lacks accounting evidence" in str(refused.value)
+    ledger._conn.close()

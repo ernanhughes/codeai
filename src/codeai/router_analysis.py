@@ -307,6 +307,17 @@ def verify_ledger(ledger_path, artifact_dir, run_id):
             usage = attempt["usage"]
             if usage != raw["usage"]:
                 raise ValueError("normalized usage mismatch")
+            # A model-backed arm whose execution succeeded must carry accounting
+            # evidence. Absence is an instrumentation failure, not a free call:
+            # letting it through as cost_usd=None lets a cost assertion pass
+            # while the accounting path never ran (W2-4 dry run, first version).
+            if attempt["status"] == "succeeded" and (
+                usage["input_tokens"] is None or usage["output_tokens"] is None
+            ):
+                raise ValueError(
+                    "model decision lacks accounting evidence: a successful "
+                    "model-backed arm reported no usage"
+                )
             cost = None
             if usage["input_tokens"] is not None and usage["output_tokens"] is not None:
                 for prefix, rates in start["pricing"]["ordered_rates"]:
