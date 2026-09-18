@@ -4,7 +4,7 @@ import hashlib
 import json
 import subprocess
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -2376,6 +2376,10 @@ class Runtime:
         instruction: str = "",
         experiment_id: str | None = None,
         arm: str | None = None,
+        context_render: str | None = None,
+        base_artifact_lineage: Mapping[str, Iterable[str]] | None = None,
+        base_claim_lineage: Mapping[str, Iterable[str]] | None = None,
+        base_required_artifact_ids: Iterable[str] | None = None,
     ) -> tuple[CallResult, ...]:
         """First genuine collaboration primitive: N sealed independent calls.
 
@@ -2389,6 +2393,32 @@ class Runtime:
         observation, interpretation, and decision evidence. The return
         contract stays tuple[CallResult, ...]: replayed branches carry
         replayed=True and the original outcome, never a new status.
+
+        ``context_render`` decides what the blindness claim rests on. Without
+        it, each branch records the selection its seal produced: a reader can
+        establish that no sibling was *chosen*, and must take the prompt string
+        on trust for what was *sent*. With it, every branch renders its selected
+        material and the prepared body must carry exactly that rendered input,
+        so the seal is provable over bytes rather than over a selection record.
+
+        A branch whose adapter cannot prepare a request fails as a branch. It is
+        never quietly downgraded to the unrendered path: a fan-out that cannot
+        prove its inputs says so instead of appearing to have proved them.
+
+        The seal excludes a sibling's material by *identity*, so base material
+        that came from a sibling must say where it came from. ``base_artifact_
+        lineage`` and ``base_claim_lineage`` carry that attribution. Material
+        handed in without lineage is indistinguishable from material that never
+        had any, and is selected: the fan-out event records how much of the base
+        was attributed, so a reader can see what the blindness claim rested on
+        rather than assuming it was complete.
+
+        Base material is *required* by default, which makes the seal loud: hand
+        a branch something its seal forbids and that branch is refused, rather
+        than quietly compiled without it. ``base_required_artifact_ids`` names
+        the subset that must be present; anything else offered becomes optional
+        and is filtered per branch, with the exclusion recorded in that branch's
+        compilation trace. Loud by default, quiet only when asked.
         """
         import uuid as _uuid
 
@@ -2411,6 +2441,26 @@ class Runtime:
                     "base_prompt": base_prompt,
                     "experiment_id": experiment_id,
                     "arm": arm,
+                    # What the blindness claim will rest on for every branch.
+                    "context_render": context_render,
+                    "input_provenance": (
+                        "rendered_bytes" if context_render else "selection_record"
+                    ),
+                    # The seal excludes by identity. Unattributed base material
+                    # cannot be excluded, so say how much of it was attributed.
+                    "base_lineage_declared": {
+                        "artifacts": len(base_artifact_lineage or {}),
+                        "claims": len(base_claim_lineage or {}),
+                    },
+                    "base_offered": {
+                        "artifacts": len(base_artifact_ids),
+                        "claims": len(base_claim_ids),
+                        "events": len(base_events),
+                    },
+                    "base_required_artifacts": (
+                        None if base_required_artifact_ids is None
+                        else sorted(str(i) for i in base_required_artifact_ids)
+                    ),
                 },
                 correlation_id=task_id,
             )
@@ -2438,18 +2488,45 @@ class Runtime:
                     set(base_seal.forbidden_lineage_ids if base_seal else frozenset()) | siblings
                 ),
             )
-            package, trace = compiler.compile_with_trace(
-                task_id=task_id,
-                actor=actor,
-                prompt=branch_prompt,
-                events=base_events,
-                artifact_ids=base_artifact_ids,
-                seal=seal,
-                objective=objective,
-                claim_ids=base_claim_ids,
-                budget_tokens=budget_tokens,
-                prompt_version=prompt_version or branch.get("prompt_version"),  # type: ignore[arg-type]
-            )
+            try:
+                # Compilation can refuse this branch on its own seal, and that
+                # refusal must not reach the siblings: a branch that cannot be
+                # compiled is a failed branch, recorded like any other.
+                package, trace = compiler.compile_with_trace(
+                    task_id=task_id,
+                    actor=actor,
+                    prompt=branch_prompt,
+                    events=base_events,
+                    artifact_ids=base_artifact_ids,
+                    seal=seal,
+                    objective=objective,
+                    claim_ids=base_claim_ids,
+                    budget_tokens=budget_tokens,
+                    prompt_version=prompt_version or branch.get("prompt_version"),  # type: ignore[arg-type]
+                    artifact_lineage=base_artifact_lineage,
+                    claim_lineage=base_claim_lineage,
+                    **(
+                        {}
+                        if base_required_artifact_ids is None
+                        else {"required_artifact_ids": tuple(base_required_artifact_ids)}
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - one branch, not the fan-out
+                failure = CallResult(
+                    call_id=call_id, raw_output="", status="failed",
+                    error=f"context compilation refused: {exc}",
+                )
+                self.ledger.append(
+                    Event.create(
+                        stream_id=call_id,
+                        kind="call.completed",
+                        actor_id=actor.actor_id,
+                        payload=_call_result_event_payload(failure),
+                        correlation_id=task_id,
+                    )
+                )
+                results.append(failure)
+                continue
             self._append_context_compiled(package, trace, actor_id=actor.actor_id, task_id=task_id)
             spec = CallSpec(
                 call_id=call_id,
@@ -2465,6 +2542,11 @@ class Runtime:
                 instruction=branch_instruction,
                 prompt_version=str(prompt_version) if prompt_version else None,
                 variant=variant,  # type: ignore[arg-type]
+                context_render=(
+                    str(branch.get("context_render", context_render))
+                    if branch.get("context_render", context_render) is not None
+                    else None
+                ),
                 metadata={"fanout_id": fanout_id},
                 experiment_id=str(branch.get("experiment_id", experiment_id))
                 if branch.get("experiment_id", experiment_id) is not None
