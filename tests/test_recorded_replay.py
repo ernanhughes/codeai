@@ -95,7 +95,8 @@ def test_replay_emits_only_requested_and_replayed(tmp_path):
     before = len(runtime.ledger.read_all())
     runtime.invoke_recorded_call(make_spec(), adapter=adapter)
     new_kinds = kinds(runtime)[before:]
-    assert new_kinds == ["call.requested", "call.replayed"]
+    assert new_kinds == [
+        "operation.governance_recorded", "call.requested", "call.replayed"]
 
 
 def test_replay_with_new_call_id_resolves_to_original(tmp_path):

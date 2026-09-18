@@ -563,9 +563,16 @@ def inconclusive_checks_for_claim(runtime: Runtime, claim_id: str) -> tuple[dict
 
 
 def run_check(
-    runtime: Runtime, request: CheckRequest, *, verifier: VerificationAdapter
+    runtime: Runtime,
+    request: CheckRequest,
+    *,
+    verifier: VerificationAdapter,
+    decision_id: str | None = None,
+    source: str | None = None,
 ) -> CheckResult:
-    """Bind the target, run the verifier, vet the result, record it, apply it."""
+    """Govern, bind the target and the artifact, run the verifier, record, apply."""
+    from .governance import GovernanceSource, govern
+
     request_event = Event.create(
         stream_id=request.check_id,
         kind=CHECK_REQUESTED,
@@ -574,6 +581,25 @@ def run_check(
         correlation_id=request.task_id,
     )
     runtime.ledger.append(request_event)
+
+    standing = govern(
+        runtime,
+        task_id=request.task_id,
+        operation="CHECK",
+        decision_id=decision_id,
+        source=source or GovernanceSource.EXTERNAL_REQUEST.value,
+        subject_kind="check",
+        subject_id=request.check_id,
+        actor_id="verifier",
+        causation_id=request_event.event_id,
+    )
+    if not standing.permits_execution:
+        # A check that may not run produced no verification result at all.
+        refused = _error(request, f"governance refused: {standing.reason}",
+                         started_at=now_utc(), completed_at=now_utc())
+        record_verification(runtime, request, bind_check_target(runtime, request), refused,
+                            request_event, verifier, None)
+        return refused
 
     binding = bind_check_target(runtime, request)
     with TemporaryDirectory(prefix="codeai-check-") as workdir:

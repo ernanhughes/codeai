@@ -86,6 +86,25 @@ acceptor the directive never authorized the process to be. Then the point of rec
 decision 2 said CHECK, reprojecting the task now yields STOP, and decision 2 still says CHECK and
 still replays to CHECK.
 
+## Repair W1-R4: a governed operation carries the decision that selected it
+
+The composition audit (gap 4) found the decision and the operation coexisting with no link in either
+direction. `codeai/governance.py` now binds them, on the scheduler-governed path only:
+
+```text
+scheduler-governed   names a decision; checked for task, operation class and freshness
+external or manual   names none; the source is recorded, and cannot pass for governed
+```
+
+`operation.governance_recorded` / `operation.governance_refused` is appended for every operation on
+the three governed entry points (`invoke_recorded_call`, `run_check`, `execute_action`), carrying the
+standing, the decision event id and both state digests. Governance runs before authority, and they
+answer different questions: *what should happen next* versus *may this actor do it*.
+
+Because the policy has no ACTION output, no effect can be scheduler-governed, and an action naming a
+decision is refused as `not_selectable`. Full matrix and limits:
+`experiments/W1-R4-decision-execution-binding.md`.
+
 ## What it still does not establish
 
 1. **A decision is not a plan.** Each call answers "what kind of work next", one step, with no

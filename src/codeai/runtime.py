@@ -106,6 +106,13 @@ from .rendering import (
     prepared_input_text,
     render_context,
 )
+from .governance import (
+    GovernanceRefused,
+    GovernanceSource,
+    GovernanceStanding,
+    govern,
+    resolve_governance,
+)
 from .process_state import PROCESS_STATE_V1, ProcessState, project_process_state, state_snapshot
 from .verification import (
     VerificationBinding,
@@ -352,6 +359,8 @@ class Runtime:
         *,
         adapter: ExecutionAdapter,
         authority: Authority | None = None,
+        decision_id: str | None = None,
+        source: str = GovernanceSource.EXTERNAL_REQUEST.value,
     ) -> ActionResult:
         request_event = Event.create(
             stream_id=request.action_id,
@@ -364,6 +373,31 @@ class Runtime:
             correlation_id=request.task_id,
         )
         self.ledger.append(request_event)
+
+        # What decision is this acting under? An effect is never scheduler-
+        # selectable, so naming one is always a mismatch; naming none records the
+        # operation as what it is, an external request.
+        standing = govern(
+            self,
+            task_id=request.task_id,
+            operation="ACTION",
+            decision_id=decision_id,
+            source=source,
+            subject_kind="action",
+            subject_id=request.action_id,
+            actor_id=request.effective_requester(),
+            causation_id=request_event.event_id,
+        )
+        if not standing.permits_execution:
+            refused = ActionResult(
+                action_id=request.action_id,
+                status=ActionStatus.FAILED,
+                started_at=now_utc(),
+                completed_at=now_utc(),
+                error=f"governance refused: {standing.reason}",
+            )
+            self._append_action_result_event(refused, actor_id=request.actor_id)
+            return refused
 
         # Authority is resolved from the record and decided before anything is
         # disclosed: a caller without a current grant learns only the denial,
@@ -488,6 +522,8 @@ class Runtime:
         request: CheckRequest,
         *,
         verifier: VerificationAdapter,
+        decision_id: str | None = None,
+        source: str = GovernanceSource.EXTERNAL_REQUEST.value,
     ) -> CheckResult:
         """Bind, verify, record, apply; see codeai.verification.
 
@@ -495,7 +531,22 @@ class Runtime:
         binding failure is always ERROR: the measurement broke, which is not the
         same as the world being unclear.
         """
-        return _run_check(self, request, verifier=verifier)
+        return _run_check(
+            self, request, verifier=verifier, decision_id=decision_id, source=source
+        )
+
+    def operation_governance(
+        self,
+        *,
+        task_id: str | None,
+        operation: str,
+        decision_id: str | None = None,
+        source: str = GovernanceSource.EXTERNAL_REQUEST.value,
+    ) -> GovernanceStanding:
+        """What decision, if any, would permit this operation. Appends nothing."""
+        return resolve_governance(
+            self, task_id=task_id, operation=operation, decision_id=decision_id, source=source
+        )
 
     def check_binding(self, request: CheckRequest) -> VerificationBinding:
         """What the runtime can establish about the state a check would examine."""
@@ -697,6 +748,8 @@ class Runtime:
         interpreter_version: str = INTERPRETER_V2,
         policy_version: str = ATTEMPT_POLICY_V2,
         model_config: Any | None = None,
+        decision_id: str | None = None,
+        source: str = GovernanceSource.EXTERNAL_REQUEST.value,
     ) -> RecordedCall:
         """Execute one logical cognition call with explicit attempt accounting.
 
@@ -751,6 +804,8 @@ class Runtime:
             interpreter_version=interpreter_version,
             policy_version=policy_version,
             model_config=model_config,
+            decision_id=decision_id,
+            source=source,
         )
         return recorded
 
@@ -763,6 +818,8 @@ class Runtime:
         interpreter_version: str = INTERPRETER_V2,
         policy_version: str = ATTEMPT_POLICY_V2,
         model_config: Any | None = None,
+        decision_id: str | None = None,
+        source: str = GovernanceSource.EXTERNAL_REQUEST.value,
     ) -> tuple[RecordedCall, CallResult, bool]:
         """Recorded invocation returning (recorded call, final result, replayed)."""
         if max_attempts < 1:
@@ -774,6 +831,21 @@ class Runtime:
                 raise ValueError(f"unknown context renderer version: {spec.context_render!r}")
             if not callable(getattr(adapter, "prepare", None)):
                 raise ValueError("context rendering requires an adapter with prepare()/send()")
+        # Shape is settled; now, what decision is this call acting under? A
+        # malformed request is refused before any event, governance included.
+        standing = govern(
+            self,
+            task_id=spec.task_id,
+            operation="CALL",
+            decision_id=decision_id,
+            source=source,
+            subject_kind="call",
+            subject_id=spec.call_id,
+            actor_id=spec.actor.actor_id,
+        )
+        if not standing.permits_execution:
+            raise GovernanceRefused(standing)
+
         # The runtime renders; a caller-supplied rendering is never trusted.
         spec = replace(spec, rendered_context=None)
         request_event = Event.create(

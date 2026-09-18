@@ -182,7 +182,10 @@ def test_an_unauthorized_caller_learns_nothing_about_the_recorded_operation(tmp_
     assert denied.reused_from_action_id is None, "a denial disclosed the recorded operation"
     assert writer.calls == 1
     kinds = [e.kind for e in runtime.ledger.read_all() if e.stream_id == "a2"]
-    assert kinds == ["action.requested", "action.authorization_refused", "action.completed"]
+    assert kinds == [
+        "action.requested", "operation.governance_recorded",
+        "action.authorization_refused", "action.completed",
+    ]
 
 
 def test_a_replay_is_disclosed_under_its_own_authorization_basis(tmp_path):

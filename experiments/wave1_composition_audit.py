@@ -446,39 +446,83 @@ def probe_b_acceptance_authority(stack) -> Probe:
 def probe_c_decision_to_execution(stack) -> Probe:
     p = Probe("C", "decision -> execution",
               "Does the runtime enforce that the executed operation is the decided one?",
-              "an effect should require the decision that justified it")
+              "a governed operation must match its decision; an ungoverned one must say so")
     b = bench(stack)
     b.directive("d-root", (Capability.WRITE,))
     b.task("t1")
     b.produce_candidate()
     decision = b.runtime.decide_next_for_task("t1")
-    p.see(f"recorded decision: {decision.operation} ({decision.reason})")
+    recorded = [
+        event for event in b.ledger.events_by_kind(("scheduler.decision_recorded",))
+        if event.payload["task_id"] == "t1"
+    ][-1].payload
+    p.see(f"recorded decision: {decision.operation} ({recorded['decision_id'][:8]}...)")
 
-    worker = HonestWriter(b)
-    result = b.runtime.execute_action(b.action("a1"), adapter=worker)
-    p.see(f"caller executed an action anyway -> {result.status}, adapter calls {worker.calls}")
+    # 1. The action claims the CHECK decision.
+    claimed = HonestWriter(b)
+    refused = b.runtime.execute_action(
+        b.action("a-claimed"), adapter=claimed,
+        decision_id=recorded["decision_id"], source="scheduler",
+    )
+    p.see(f"action claiming that CHECK decision -> {refused.status}, "
+          f"adapter calls {claimed.calls}")
 
-    b2 = bench(stack)
-    b2.directive("d-root", (Capability.WRITE,))
-    b2.task("t1")
-    worker2 = HonestWriter(b2)
-    none_decided = b2.runtime.execute_action(b2.action("a1"), adapter=worker2)
-    p.see(f"with no decision recorded at all -> {none_decided.status}, "
-          f"adapter calls {worker2.calls}")
-    decisions = b2.ledger.events_by_kind(("scheduler.decision_recorded",))
-    p.see(f"scheduler decisions in that ledger: {len(decisions)}")
+    # 2. The action claims the scheduler without naming a decision.
+    masquerade = HonestWriter(b)
+    pretending = b.runtime.execute_action(
+        b.action("a-pretend"), adapter=masquerade, source="scheduler"
+    )
+    p.see(f"action claiming scheduler governance with no decision -> {pretending.status}, "
+          f"adapter calls {masquerade.calls}")
 
-    requested = b.ledger.events_by_kind(("action.requested",))
-    fields = sorted(requested[0].payload) if requested else []
-    p.see(f"action.requested payload references a decision: "
-          f"{any('decision' in f for f in fields)}")
-    p.see(f"action.requested fields: {fields}")
-    p.classification = "CONVENTIONAL"
-    p.note = ("The decision and the effect coexist in the ledger with no causal or referential link. "
-              "ACTION is unreachable from the scheduler by design, so no decision can ever name the "
-              "effect that follows it.")
+    # 3. The action claims nothing: still allowed, and recorded as what it is.
+    external = HonestWriter(b)
+    allowed = b.runtime.execute_action(b.action("a-external"), adapter=external)
+    governance = [
+        event for event in b.ledger.events_by_kind(("operation.governance_recorded",))
+        if event.payload["subject_id"] == "a-external"
+    ][0].payload
+    p.see(f"action claiming nothing -> {allowed.status}, adapter calls {external.calls}, "
+          f"recorded as {governance['status']}/{governance['source']}")
+
+    # 4. A check under a decision taken on the state as it stands now. The
+    #    earlier decision is already stale: the external action moved the basis.
+    fresh = b.runtime.decide_next_for_task("t1")
+    fresh_id = [
+        event for event in b.ledger.events_by_kind(("scheduler.decision_recorded",))
+        if event.payload["task_id"] == "t1"
+    ][-1].payload["decision_id"]
+    p.see(f"a decision taken now says: {fresh.operation}")
+    governed = b.runtime.run_check(
+        b.check("k-governed", script="import sys; sys.exit(0)"),
+        verifier=LocalCommandVerifier(),
+        decision_id=fresh_id, source="scheduler",
+    )
+    p.see(f"check under that fresh CHECK decision -> {governed.verdict}")
+
+    # 5. The first decision, long since overtaken by the world.
+    stale = b.runtime.run_check(
+        b.check("k-stale", script="import sys; sys.exit(0)"),
+        verifier=LocalCommandVerifier(),
+        decision_id=recorded["decision_id"], source="scheduler",
+    )
+    p.see(f"the first decision, after the state moved -> {stale.verdict} "
+          f"({(stale.error or '')[:52]}...)")
+
+    mismatch_refused = refused.status != ActionStatus.SUCCEEDED and claimed.calls == 0
+    masquerade_refused = pretending.status != ActionStatus.SUCCEEDED and masquerade.calls == 0
+    external_visible = governance["status"] == "ungoverned"
+    p.classification = (
+        "ENFORCED" if (mismatch_refused and masquerade_refused and external_visible)
+        else "CONVENTIONAL"
+    )
+    p.note = ("Baseline (f0c730b): the decision and the effect coexisted with no link in either "
+              "direction. After W1-R4 an operation that claims a decision is checked against it "
+              "for task, operation class and freshness, and an operation that claims none is "
+              "recorded as external rather than silently passing for governed. The scheduler "
+              "still cannot select ACTION, so no effect can be scheduler-governed: that is the "
+              "book's position, now enforced rather than assumed.")
     b.close()
-    b2.close()
     return p
 
 

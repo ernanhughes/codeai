@@ -93,6 +93,7 @@ def test_allowed_action_records_request_and_result(tmp_path: Path):
     # The fixture's directive registration comes first; the action follows.
     assert [event.kind for event in runtime.ledger.read_all()][2:] == [
         "action.requested",
+        "operation.governance_recorded",  # what decision it acts under, if any
         "action.authorized",  # the grant the record establishes, with its basis
         "action.execution_started",  # committed before the adapter acts
         "action.completed",
