@@ -34,6 +34,26 @@ def test_ch22_action_recovery_example(capsys):
     assert summary["result_status_after_reconciliation"] == "failed"
 
 
+def test_ch19_effect_observation_example(capsys):
+    summary = load("ch19_effect_observation.py").main()
+    capsys.readouterr()
+
+    # Every worker said the same thing.
+    assert summary["reports"] == ["succeeded"]
+    # The record said four different things.
+    assert summary["diligent"]["effect"] == "observed"
+    assert summary["busy"]["effect"] == "observed"
+    assert summary["idle"]["effect"] == "unknown"
+    assert summary["unwatched"]["effect"] == "reported"
+    # A changed scope is not the intended change: same effect state, opposite verdicts.
+    assert summary["diligent"]["verdict"] == "PASS"
+    assert summary["busy"]["verdict"] == "FAIL"
+    # A success the readings contradict becomes a person's problem, not a retry.
+    assert summary["idle"]["next"] == "reconcile_effect"
+    assert summary["idle"]["duplicate_effect_risk"] is True
+    assert summary["open_effects"] == ["a-idle"]
+
+
 def test_ch21_verification_example(capsys):
     summary = load("ch21_verification.py").main()
     capsys.readouterr()

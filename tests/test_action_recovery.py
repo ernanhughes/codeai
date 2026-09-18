@@ -13,6 +13,7 @@ from codeai.actions import (
     EffectState,
     ReconciliationRefused,
     ReconciliationVerdict,
+    StateObservation,
 )
 from codeai.adapters import ActionRequest, ActionResult, ActionStatus
 from codeai.domain import Authority, Capability
@@ -27,6 +28,18 @@ class CountingWriter:
     def execute(self, request: ActionRequest) -> ActionResult:
         self.calls += 1
         return ActionResult(action_id=request.action_id, status=ActionStatus.SUCCEEDED)
+
+
+class WorldChangingWriter(CountingWriter):
+    """Writes something the state resolver can see."""
+
+    def __init__(self, world):
+        super().__init__()
+        self.world = world
+
+    def execute(self, request: ActionRequest) -> ActionResult:
+        self.world["state"] = "after"
+        return super().execute(request)
 
 
 class CrashAfterEffectWriter(CountingWriter):
@@ -110,14 +123,47 @@ def test_execution_started_without_completion_is_unknown_and_never_auto_retried(
     assert state.duplicate_effect_risk is True
 
 
-def test_success_is_observed_and_terminal(tmp_path):
-    runtime = runtime_with(tmp_path, state_resolver=lambda: "after")
-    runtime.execute_action(write_request(), authority=write_auth(), adapter=CountingWriter())
+def test_success_with_a_changed_scope_is_observed(tmp_path):
+    world = {"state": "before"}
+    runtime = runtime_with(tmp_path, state_resolver=lambda: world["state"])
+    runtime.execute_action(
+        write_request(), authority=write_auth(), adapter=WorldChangingWriter(world)
+    )
     state = runtime.action_state("a1")
     assert (state.stage, state.result_status) == ("completed", "succeeded")
     assert state.effect_state == EffectState.OBSERVED
+    assert state.state_observation == StateObservation.CHANGED
     assert state.next_operation == ActionNextOperation.NONE
-    assert state.observed_state_hash == "after"
+    assert (state.state_hash_before, state.observed_state_hash) == ("before", "after")
+    # Even here the record claims only that the scope moved, not that the
+    # intended change was made. That is verification, not recovery.
+    assert "not evidence that the intended change was made" in state.reason
+
+
+def test_success_without_a_change_in_the_observed_scope_is_unknown(tmp_path):
+    """Audit gap 1: the report says done and the runtime own readings disagree."""
+    runtime = runtime_with(tmp_path, state_resolver=lambda: "unmoved")
+    runtime.execute_action(write_request(), authority=write_auth(), adapter=CountingWriter())
+    state = runtime.action_state("a1")
+    assert state.result_status == "succeeded", "the report is still what it was"
+    assert state.state_observation == StateObservation.UNCHANGED
+    assert state.effect_state == EffectState.UNKNOWN
+    assert state.effect_state != EffectState.OBSERVED
+    assert state.next_operation == ActionNextOperation.RECONCILE_EFFECT
+    assert state.duplicate_effect_risk is True
+    # It is not a refutation either: the effect may be outside the resolver scope.
+    assert "outside that scope or not at all" in state.reason
+
+
+def test_success_with_no_observation_available_is_reported_not_observed(tmp_path):
+    runtime = runtime_with(tmp_path)  # no state resolver at all
+    runtime.execute_action(write_request(), authority=write_auth(), adapter=CountingWriter())
+    state = runtime.action_state("a1")
+    assert state.state_observation == StateObservation.UNAVAILABLE
+    assert state.effect_state == EffectState.REPORTED
+    assert state.next_operation == ActionNextOperation.NONE
+    assert state.duplicate_effect_risk is False
+    assert "the actor report is the only basis" in state.reason
 
 
 def test_denial_means_no_effect_was_possible(tmp_path):
@@ -172,7 +218,9 @@ def test_replay_reports_no_new_effect_and_names_the_original(tmp_path):
     assert replayed.stage == "replayed"
     assert replayed.effect_state == EffectState.NONE
     assert replayed.reused_from_action_id == "a1"
-    assert runtime.action_state("a1").effect_state == EffectState.OBSERVED
+    # No resolver in this fixture, so the original is REPORTED: a claim about
+    # the world that the runtime never corroborated.
+    assert runtime.action_state("a1").effect_state == EffectState.REPORTED
 
 
 # ---------------- history it cannot see ----------------
@@ -254,7 +302,7 @@ def test_reconciling_a_settled_action_is_refused_durably(tmp_path):
         )
     kinds = [e.kind for e in runtime.ledger.read_all()]
     assert kinds[-1] == "action.reconcile_refused", "a refusal only a caller can see"
-    assert runtime.action_state("a1").effect_state == EffectState.OBSERVED
+    assert runtime.action_state("a1").effect_state == EffectState.REPORTED
 
 
 def test_unknown_verdicts_are_rejected(tmp_path):
@@ -297,7 +345,9 @@ def test_open_effects_lists_exactly_the_unknown_ones(tmp_path):
         ("before_request", None, None),
         ("after_request", EffectState.NONE, ActionNextOperation.START_ACTION),
         ("after_execution_started", EffectState.UNKNOWN, ActionNextOperation.RECONCILE_EFFECT),
-        ("after_completion", EffectState.OBSERVED, ActionNextOperation.NONE),
+        # The hand-appended execution_started carries no pre-effect reading, so
+        # the completion can only be the actor word for it.
+        ("after_completion", EffectState.REPORTED, ActionNextOperation.NONE),
     ],
 )
 def test_every_interruption_point_answers_safe_unsafe_or_unresolved(

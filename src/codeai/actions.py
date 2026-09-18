@@ -6,12 +6,23 @@ may have happened". Actions had no equivalent. A request was recorded, the
 adapter was invoked, and only the completion was written, so an interrupted
 action left a record that could not answer the one question recovery needs.
 
-This module gives actions the same ordering argument, and keeps two things
+This module gives actions the same ordering argument, and keeps three things
 apart that the single ``ActionStatus`` enum conflates:
 
-    result status   what the operation reported: SUCCEEDED, FAILED, DENIED
-    effect state    what the record establishes about the world:
-                    NONE, UNKNOWN, OBSERVED
+    result status      what the actor reported:  SUCCEEDED, FAILED, DENIED
+    state observation  what the runtime read:    CHANGED, UNCHANGED, UNAVAILABLE
+    effect state       what the record supports: NONE, REPORTED, UNKNOWN, OBSERVED
+
+The observation is the runtime own pair of readings: one before the adapter
+runs, one after, both recorded. It answers a narrower question than it appears
+to.
+
+    CHANGED does not mean the intended effect occurred. It means the observed
+    scope is not what it was. Whether the change was the *right* change is
+    verification question, not recovery.
+
+    UNCHANGED does not mean nothing happened. The effect may have landed outside
+    the resolver scope, or written identical bytes.
 
 ``FAILED`` is a result status. It is not an answer to *could the effect have
 happened?* — an adapter can fail after writing. The ordering that makes the
@@ -28,7 +39,9 @@ From that, for actions recorded by a runtime that emits ``execution_started``:
 
     requested, no execution_started      effect NONE      safe to start
     execution_started, no completion     effect UNKNOWN   reconcile, never retry
-    completed SUCCEEDED                  effect OBSERVED  terminal
+    completed SUCCEEDED, scope changed   effect OBSERVED  terminal
+    completed SUCCEEDED, scope unchanged effect UNKNOWN   reconcile
+    completed SUCCEEDED, no observation  effect REPORTED  the actor word alone
     completed DENIED                     effect NONE      terminal
     completed FAILED after start         effect UNKNOWN   reconcile
     completed FAILED before start        effect NONE      fix the inputs
@@ -37,6 +50,11 @@ Actions recorded before this event existed cannot be read that way: a request
 without a completion could have been interrupted on either side of the adapter
 call. Those stay UNKNOWN. The projection refuses to rewrite history it cannot
 see.
+
+A reported success the runtime could not corroborate is ``REPORTED``, not
+``OBSERVED``. That distinction exists because the Wave 1 composition audit found
+the runtime calling an actor word an observation while holding two identical
+state readings it never compared (audit gap 1).
 
 Reconciliation is append-only evidence about an unknown effect, never an
 erasure of it. ``STILL_UNKNOWN`` is a valid final answer.
@@ -61,8 +79,19 @@ class EffectState(StrEnum):
     """What the record establishes about the world, not what was reported."""
 
     NONE = "none"
+    # An effect was reported and nothing independent corroborates it. Weaker
+    # than OBSERVED, and not UNKNOWN either: nothing contradicts it.
+    REPORTED = "reported"
     UNKNOWN = "unknown"
     OBSERVED = "observed"
+
+
+class StateObservation(StrEnum):
+    """The runtime own before/after reading of the scope it can see."""
+
+    CHANGED = "changed"
+    UNCHANGED = "unchanged"
+    UNAVAILABLE = "unavailable"
 
 
 class ActionNextOperation(StrEnum):
@@ -110,6 +139,8 @@ class ActionWorkState:
     version: str = ACTION_RECOVERY_V1
     reused_from_action_id: str | None = None
     observed_state_hash: str | None = None
+    state_hash_before: str | None = None
+    state_observation: str = StateObservation.UNAVAILABLE.value
     reconciliations: tuple[Reconciliation, ...] = ()
 
 
@@ -196,6 +227,15 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
     completed = next((e for e in action_events if e.kind == "action.completed"), None)
     refused = next((e for e in action_events if e.kind == "action.replay_refused"), None)
 
+    before = started.payload.get("state_hash_before") if started is not None else None
+    after = completed.payload.get("observed_state_hash") if completed is not None else None
+    if before is None or after is None:
+        observation = StateObservation.UNAVAILABLE.value
+    elif str(before) != str(after):
+        observation = StateObservation.CHANGED.value
+    else:
+        observation = StateObservation.UNCHANGED.value
+
     task_id = requested.payload.get("task_id")
     key = requested.payload.get("idempotency_key")
     marks_execution = str(requested.payload.get("recovery_version") or "") == ACTION_RECOVERY_V1
@@ -210,6 +250,8 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
         duplicate_effect_risk=False,
         reason="",
         basis="record",
+        state_hash_before=str(before) if before else None,
+        state_observation=observation,
         reconciliations=_reconciliations(action_events),
     )
 
@@ -231,13 +273,44 @@ def project_action_state(events: tuple[Event, ...], action_id: str) -> ActionWor
                 reason="recorded outcome returned under the same key; no new effect by construction",
                 **common,
             )
-        elif status == "succeeded":
+        elif status == "succeeded" and observation == StateObservation.CHANGED.value:
             state = _replace(
                 base,
                 stage="completed",
                 effect_state=EffectState.OBSERVED.value,
                 next_operation=ActionNextOperation.NONE.value,
-                reason="completed with the runtime's own observation of the resulting state",
+                reason=(
+                    "reported success, and the runtime own readings differ across the effect; "
+                    "a changed scope is not evidence that the intended change was made"
+                ),
+                **common,
+            )
+        elif status == "succeeded" and observation == StateObservation.UNCHANGED.value:
+            # The report and the runtime own readings disagree. Neither wins: the
+            # effect may have landed outside the resolver scope, or written
+            # identical bytes, or never happened at all.
+            state = _replace(
+                base,
+                stage="completed_unobserved",
+                effect_state=EffectState.UNKNOWN.value,
+                next_operation=ActionNextOperation.RECONCILE_EFFECT.value,
+                duplicate_effect_risk=True,
+                reason=(
+                    "reported success while the observed scope did not change; the record cannot "
+                    "say whether the effect happened outside that scope or not at all"
+                ),
+                **common,
+            )
+        elif status == "succeeded":
+            state = _replace(
+                base,
+                stage="completed",
+                effect_state=EffectState.REPORTED.value,
+                next_operation=ActionNextOperation.NONE.value,
+                reason=(
+                    "reported success with no observation available; the actor report is the only "
+                    "basis, so this is a claim about the world and not a reading of it"
+                ),
                 **common,
             )
         elif status == "denied":
