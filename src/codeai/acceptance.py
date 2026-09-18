@@ -1,7 +1,23 @@
 """Explicit task acceptance and a derived completion projection (Stage 14).
 
 A succeeded cognition call is an observation that output exists; it is not
-completed work. A task projects as completed only when:
+completed work. Authority to accept is resolved from the task own recorded directive chain, not
+from an ``Authority`` object the caller passes in (composition audit gap 2). The
+caller argument is recorded as a claim and never consulted:
+
+    task.created names a directive
+          -> resolve that chain, intersected the same way actions resolve it
+          -> ACCEPT in the effective grant, or the acceptance is refused
+
+The directive is read from the task record rather than the request, because a
+caller who could name the directive could name a permissive one. A task whose
+chain does not grant ACCEPT cannot be accepted by anyone through this API until
+the record says otherwise.
+
+This resolves authority from the durable record. It does not authenticate the
+acceptor: ``actor_id`` remains attribution, not identity.
+
+A task projects as completed only when:
 
 1. an acceptor whose authority grants ``Capability.ACCEPT`` submits an
    acceptance naming the task, the task's declared criteria (by hash), the
@@ -36,6 +52,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from .adapters import CheckVerdict
+from .authority import AuthorizationStatus, authorize, resolve_directive_authority
 from .artifacts import ArtifactCorruptionError
 from .domain import Authority, Capability, GenerationState, LogicalCallStatus
 from .ledger import Event
@@ -129,8 +146,14 @@ def accept_task(
     an interruption between the two appends); a different acceptance for an
     already-accepted task is refused.
     """
-    if not authority.allows(Capability.ACCEPT):
-        _reject(runtime, request, authority, ("unauthorized",))
+    # Resolved from the record before anything else is considered, and before
+    # any prior acceptance is disclosed: a caller with no current grant learns
+    # only the refusal.
+    decision, directive_id = resolve_acceptance_authority(runtime, request.task_id)
+    reasons = _authority_reasons(decision, directive_id)
+    if reasons:
+        _reject(runtime, request, authority, reasons, decision=decision,
+                directive_id=directive_id)
 
     prior = _task_events(runtime, TASK_ACCEPTED, request.task_id)
     if prior:
@@ -143,7 +166,8 @@ def accept_task(
 
     reasons, check_event_ids = _validate(runtime, request)
     if reasons:
-        _reject(runtime, request, authority, reasons)
+        _reject(runtime, request, authority, reasons, decision=decision,
+                directive_id=directive_id)
 
     accepted = Event.create(
         stream_id=request.task_id,
@@ -152,7 +176,9 @@ def accept_task(
         payload={
             **request.identity(),
             "acceptance_id": request.acceptance_id,
-            "authority_basis": sorted(capability.value for capability in authority.capabilities),
+            "directive_id": directive_id,
+            "authority_basis": decision.basis_payload(),
+            "caller_claimed_capabilities": _claimed(authority),
             "check_completed_event_ids": check_event_ids,
         },
         correlation_id=request.task_id,
@@ -205,6 +231,33 @@ def project_task_completion(runtime: Runtime, task_id: str) -> TaskCompletion:
 
 
 # ---------------- validation ----------------
+
+
+def resolve_acceptance_authority(runtime: Runtime, task_id: str):
+    """Resolve ACCEPT for a task from its own recorded directive. Appends nothing.
+
+    Returns (decision, directive_id). The directive comes from ``task.created``:
+    a caller who could name it could name a permissive one.
+    """
+    events = runtime.ledger.read_all()
+    created = _task_events(runtime, "task.created", task_id)
+    directive_id = None
+    if len(created) == 1:
+        raw = created[0].payload.get("directive_id")
+        directive_id = str(raw) if raw else None
+    standing = resolve_directive_authority(events, directive_id)
+    return authorize(standing, Capability.ACCEPT), directive_id
+
+
+def _authority_reasons(decision, directive_id: str | None) -> list[str]:
+    """Why this task may not be accepted, in the vocabulary of the record."""
+    if decision.granted:
+        return []
+    if directive_id is None:
+        return ["acceptance_authority_unresolved:task_names_no_directive"]
+    if decision.status == AuthorizationStatus.DENIED:
+        return [f"acceptance_not_granted:{directive_id}"]
+    return [f"acceptance_authority_unresolved:{decision.status}:{directive_id}"]
 
 
 def _validate(runtime: Runtime, request: AcceptanceRequest) -> tuple[list[str], list[str]]:
@@ -400,11 +453,19 @@ def _append_completion(runtime: Runtime, acceptance: Event) -> Event:
     return event
 
 
+def _claimed(authority: Authority | None) -> list[str]:
+    """What the caller passed. Recorded, never consulted."""
+    return sorted(str(c) for c in (authority.capabilities if authority else ()))
+
+
 def _reject(
     runtime: Runtime,
     request: AcceptanceRequest,
-    authority: Authority,
+    authority: Authority | None,
     reasons: Iterable[str],
+    *,
+    decision=None,
+    directive_id: str | None = None,
 ) -> None:
     reasons = tuple(reasons)
     event = Event.create(
@@ -415,7 +476,9 @@ def _reject(
             **request.identity(),
             "acceptance_id": request.acceptance_id,
             "reasons": list(reasons),
-            "authority_basis": sorted(capability.value for capability in authority.capabilities),
+            "directive_id": directive_id,
+            "authority_basis": decision.basis_payload() if decision is not None else None,
+            "caller_claimed_capabilities": _claimed(authority),
         },
         correlation_id=request.task_id,
     )

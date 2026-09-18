@@ -73,6 +73,29 @@ instead of "appends nothing". Full suite: 491 passed.
 
 `examples/applied_ai/ch20_authority.py`, asserted by `tests/test_examples.py`.
 
+## Repair W1-R2: acceptance resolves the same way
+
+The Wave 1 composition audit (gap 2) found the other half of the same question answered by a
+different standard: `accept_task` took an `Authority` object from its caller.
+
+```text
+recorded directive -> action authority      ENFORCED   (this seam)
+recorded directive -> acceptance authority  ENFORCED   (W1-R2)
+```
+
+The directive is read from `task.created`, never from the acceptance request: a caller who could name
+the directive could name a permissive one. `accept_task(authority=...)` keeps its parameter, never
+consults it, and records it as `caller_claimed_capabilities`. Both `task.accepted` and
+`task.acceptance_rejected` carry the `directive_id` and the resolved basis, so an acceptance can be
+re-resolved later rather than merely re-read.
+
+Refusals distinguish *not granted* from *unresolvable*, and an unresolvable chain never falls back to
+the caller. Details and the full case matrix: `experiments/W1-R2-authority-symmetry.md`.
+
+**Consequence, recorded rather than smoothed over:** a task whose chain never granted ACCEPT cannot
+be accepted by anyone through this API. The scheduler's ASK_HUMAN on such a task names a gate no call
+can pass. There is no explicit override path, by design so far.
+
 ## What it still does not establish
 
 1. **No authentication.** `requested_by` and `actor_id` remain caller-supplied strings. A recorded
@@ -83,8 +106,8 @@ instead of "appends nothing". Full suite: 491 passed.
    destination or an expiry.
 4. **No containment.** The adapter runs with whatever the process can reach.
 5. **Directive-less actions still trust the caller**, by design and by record.
-6. **Task authority is not resolved.** `create_task` still carries its own authority field; only the
-   action path resolves from the directive chain.
+6. **Task authority is not resolved.** `create_task` still carries its own authority field and it is
+   still unused. Acceptance no longer relies on it (see below); only `create_task` itself does.
 7. **Decision-basis gating is deliberately absent.** Refusing an action whose Chapter 18 decision has
    moved is freshness, not authority. It stays in the ledger as separate work so Chapter 20 does not
    absorb Chapter 18.

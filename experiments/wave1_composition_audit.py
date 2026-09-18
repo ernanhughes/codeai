@@ -287,8 +287,8 @@ def happy_path(stack) -> dict[str, object]:
     def step(name: str, **facts):
         trace.append({"step": name, **facts})
 
-    b.directive("d-root", (Capability.WRITE,))
-    b.directive("d-child", (Capability.WRITE,), parent="d-root")
+    b.directive("d-root", (Capability.WRITE, Capability.ACCEPT))
+    b.directive("d-child", (Capability.WRITE, Capability.ACCEPT), parent="d-root")
     b.task("t1", "d-child")
     step("directive recorded",
          chain=[link.directive_id for link in b.runtime.directive_authority("d-child").grant_chain],
@@ -332,12 +332,13 @@ def happy_path(stack) -> dict[str, object]:
     )
     accepted = None
     try:
-        completion = b.runtime.accept_task(acceptance, authority=Authority(frozenset({Capability.ACCEPT})))
+        completion = b.runtime.accept_task(acceptance)
         accepted = str(completion.status)
     except AcceptanceRejected as exc:
         accepted = f"rejected: {', '.join(exc.reasons)}"
+    standing = b.runtime.acceptance_authority("t1")
     step("acceptance", outcome=accepted,
-         acceptance_authority="caller-supplied Authority({ACCEPT})")
+         acceptance_authority=f"resolved from the record: {standing.status}")
 
     fourth = b.runtime.decide_next_for_task("t1")
     step("decision 4", operation=str(fourth.operation), reason=fourth.reason)
@@ -390,6 +391,7 @@ def probe_b_acceptance_authority(stack) -> Probe:
     p = Probe("B", "directive -> acceptance authority",
               "Can a caller accept a task when the recorded directive grants no ACCEPT?",
               "acceptance authority should come from the same recorded chain as action authority")
+    # W1-R2 repaired this joint; the probe still asks the same question.
     b = bench(stack)
     b.directive("d-root", (Capability.WRITE,))  # deliberately no ACCEPT
     b.task("t1")
@@ -417,11 +419,18 @@ def probe_b_acceptance_authority(stack) -> Probe:
     p.see(f"caller passed Authority({{ACCEPT}}) against a record that grants none -> {outcome}")
     p.see(f"task completion projects: {b.runtime.task_completion('t1').status}")
     accepted = b.ledger.events_by_kind(("task.accepted",))
-    p.see(f"task.accepted payload names a directive: "
-          f"{'directive_id' in (accepted[0].payload if accepted else {})}")
+    refused = b.ledger.events_by_kind(("task.acceptance_rejected",))
+    p.see(f"task.accepted events: {len(accepted)}; durable refusals: {len(refused)}")
+    if refused:
+        payload = refused[-1].payload
+        p.see(f"refusal names the directive it resolved: {payload.get('directive_id')}")
+        p.see(f"refusal basis status: {(payload.get('authority_basis') or {}).get('status')}")
+        p.see(f"what the caller claimed, recorded as a claim: "
+              f"{payload.get('caller_claimed_capabilities')}")
     p.classification = "RECORDED" if accepted else "ENFORCED"
-    p.note = ("The acceptance is durable and attributable, but the grant behind it is the caller's "
-              "argument, not a resolution of the recorded chain.")
+    p.note = ("Baseline (f0c730b): the grant behind an acceptance was the caller's argument. After "
+              "W1-R2 it is resolved from the task's own recorded directive chain, and what the "
+              "caller passes is recorded as a claim that changes nothing.")
     b.close()
     return p
 
@@ -665,7 +674,7 @@ def probe_i_verification_to_acceptance(stack) -> Probe:
               "Which verification records can acceptance rely on, and are they bound to the bytes?",
               "acceptance must not rest on a stale, unbound, inconclusive or errored check")
     b = bench(stack)
-    b.directive("d-root", (Capability.WRITE,))
+    b.directive("d-root", (Capability.WRITE, Capability.ACCEPT))
     b.task("t1")
     produced = b.produce_candidate()
     other = b.produce_candidate(text="A different paragraph entirely [S1].")
@@ -680,8 +689,7 @@ def probe_i_verification_to_acceptance(stack) -> Probe:
             source_interpretation_id=produced["interpretation_id"], check_ids=tuple(check_ids),
         )
         try:
-            return str(b.runtime.accept_task(
-                request, authority=Authority(frozenset({Capability.ACCEPT}))).status)
+            return str(b.runtime.accept_task(request).status)
         except AcceptanceRejected as exc:
             return f"rejected: {', '.join(exc.reasons)}"
 
@@ -826,7 +834,7 @@ def probe_m_artifact_label(stack) -> Probe:
               "Is the artifact a check claims to have examined established, or merely labelled?",
               "acceptance should rest on a check that demonstrably examined those bytes")
     b = bench(stack)
-    b.directive("d-root", (Capability.WRITE,))
+    b.directive("d-root", (Capability.WRITE, Capability.ACCEPT))
     b.task("t1")
     produced = b.produce_candidate()
 
@@ -843,8 +851,7 @@ def probe_m_artifact_label(stack) -> Probe:
         source_interpretation_id=produced["interpretation_id"], check_ids=("k-blind",),
     )
     try:
-        outcome = str(b.runtime.accept_task(
-            request, authority=Authority(frozenset({Capability.ACCEPT}))).status)
+        outcome = str(b.runtime.accept_task(request).status)
     except AcceptanceRejected as exc:
         outcome = f"rejected: {', '.join(exc.reasons)}"
     p.see("check command: 'sys.exit(0)' -- it never opened the artifact")
@@ -856,6 +863,45 @@ def probe_m_artifact_label(stack) -> Probe:
     p.note = ("The artifact a check examined is asserted by whoever built the CheckRequest. The "
               "verification seam established the *state* binding from the runtime's own reading; "
               "acceptance relies on a different and weaker binding for bytes.")
+    b.close()
+    return p
+
+
+def probe_n_human_gate_and_acceptance_grant(stack) -> Probe:
+    p = Probe("N", "scheduler human gate -> acceptance authority",
+              "When the scheduler asks for a human, can a human answer?",
+              "ASK_HUMAN should name a gate somebody can pass")
+    b = bench(stack)
+    b.directive("d-root", (Capability.WRITE,))  # no ACCEPT anywhere in the chain
+    b.task("t1")
+    produced = b.produce_candidate()
+    b.runtime.run_check(
+        b.check("k1", script="import sys; sys.exit(0)",
+                target=artifact_target(produced["artifact_sha256"])),
+        verifier=LocalCommandVerifier(),
+    )
+    decision = b.runtime.decide_next_for_task("t1")
+    p.see(f"scheduler: {decision.operation} ({decision.reason})")
+
+    request = AcceptanceRequest(
+        acceptance_id=str(uuid.uuid4()), task_id="t1", actor_id="a-human-reviewer",
+        criteria_sha256=criteria_sha256(CRITERIA), artifact_sha256=produced["artifact_sha256"],
+        source_call_id=produced["call_id"], source_attempt_id=produced["attempt_id"],
+        source_interpretation_id=produced["interpretation_id"], check_ids=("k1",),
+    )
+    try:
+        outcome = str(b.runtime.accept_task(request).status)
+    except AcceptanceRejected as exc:
+        outcome = f"rejected: {', '.join(exc.reasons)}"
+    p.see(f"a human answering that gate -> {outcome}")
+    p.see(f"the task ends at: {b.runtime.decide_next_for_task('t1').operation}")
+    p.see("the gate can only be opened by recording a grant, which this task cannot acquire")
+    p.classification = "ABSENT"
+    p.note = ("W1-R2 makes acceptance authority come from the record, which means ASK_HUMAN on a "
+              "chain without ACCEPT names a gate no API call can pass. Either the directive grants "
+              "ACCEPT up front, or the task cannot be accepted. There is no explicit, durably "
+              "attributed override path -- by design so far, and a decision the author should make "
+              "knowingly.")
     b.close()
     return p
 
@@ -874,6 +920,7 @@ PROBES = (
     probe_k_replay_authority,
     probe_l_decision_provenance,
     probe_m_artifact_label,
+    probe_n_human_gate_and_acceptance_grant,
 )
 
 

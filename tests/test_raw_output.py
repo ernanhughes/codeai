@@ -25,7 +25,7 @@ from codeai.acceptance import (
 from codeai.adapters import CallSpec, CheckRequest, CheckResult, CheckVerdict, FakeCognitionAdapter
 from codeai.artifacts import FileArtifactStore
 from codeai.context import ContextCompiler
-from codeai.domain import ActorRef, Authority, Budget, Capability, Task
+from codeai.domain import ActorRef, Authority, Budget, Capability, Directive, Task
 from codeai.interpretation import (
     ATTEMPT_POLICY_V1,
     ATTEMPT_POLICY_V2,
@@ -77,6 +77,11 @@ def adapter(provider):
 def observed_under_v1(path: Path):
     """Day one: the call runs under the historical v1 interpreter and policy."""
     runtime = make_runtime(path)
+    # Acceptance authority is resolved from the task directive, so record one.
+    runtime.open_directive(
+        Directive(directive_id="run-17", objective="review", success_criteria=(),
+                  budget=Budget(), authority=Authority(frozenset({Capability.ACCEPT})))
+    )
     runtime.create_task(Task("task-17", "run-17", "Review", CRITERIA, Budget(), Authority()))
     provider = Provider()
     recorded = runtime.invoke_recorded_call(spec(), adapter=adapter(provider),
