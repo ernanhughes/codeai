@@ -219,3 +219,6 @@ __marimo__/
 
 # CodeAI durable runtime state
 .codeai/
+
+# aitest local evidence and runtime state
+.aitest/
